@@ -16,6 +16,8 @@
 
 ## 使用方式
 
+WARNING：参数有部分变动，详细可以看 config.template.json 的配置！其实主要是添加了一些日志的开关。
+
 主要配置一下配置文件就可以愉快地玩耍了，本项目的参数并不复杂，这里就不一一赘述了。
 
 主要就是复制一个配置文件 config.template.json，重命名为 config.json，然后把你的 cookie 放进去。可以通过 keywords 先过滤掉一些和我们这次找面经无关的内容，max_pages 和 max_items_per_keyword 分别控制可爬取的总页数和最大爬取数量，默认是 5 和 10。
@@ -27,17 +29,17 @@ output_file，output_formats 分别用于控制导出文件的前缀名和需要
 <div align="center">
 
 基于 Pandas 导出的高度结构化 xlsx 表格 <br>
-<img width="800" alt="xlsx效果展示" src="https://github.com/user-attachments/assets/e666e0c9-e4b0-4e4e-aa05-35fec12cca2b" />
+<img width="800" alt="xlsx效果展示" src="https://github.com/user-attachments/assets/5f62da01-bb5a-4996-ad2b-71c185cb4986" />
 
 <br><br>
 
 自动生成具有良好排版阅读体验的 Markdown 文档 <br>
-<img width="800" alt="md效果展示" src="https://github.com/user-attachments/assets/84b7d7d8-646d-43ad-aed7-66821fb1c60b" />
+<img width="800" alt="md效果展示" src="https://github.com/user-attachments/assets/3de6b12c-68aa-4aa7-9120-028249354243" />
 
 <br><br>
 
 纯净降噪、高度还原段落换行的 TXT 阅览流 <br>
-<img width="800" alt="txt效果展示" src="https://github.com/user-attachments/assets/1c64943a-0f26-4168-9627-fe818c1bd88c" />
+<img width="800" alt="txt效果展示" src="https://github.com/user-attachments/assets/20f59678-0416-4b42-80f1-15268d957c1b" />
 
 </div>
 
@@ -46,3 +48,25 @@ output_file，output_formats 分别用于控制导出文件的前缀名和需要
 未来可能接入个定时任务，每天定时发送面经？或者结合 AI 做一个知识库？
 
 如果项目有问题欢迎提相关 issue，后续如果有需要也会继续更新完善项目~
+
+## 更新日志
+
+v1.0 
+
+初始化项目，完成基本的爬虫功能，实现了基本的爬取与归档~
+
+v1.6 
+
+对于匹配的机制更加严格，除了校验标题之外（因为可能标题是引流写的，正文部分就不是面经），参考 AC 算法在美团上单系统的使用，设计类似的 AC 自动机匹配规则，同时完善匹配流程，添加文本相关性校验，同时完成公司名的确认与持续集成，以及归档文件格式的部分调整。
+
+对于标题的校验更加严格，除了黑名单机制预排除部分无关面经之外，添加噪音部分，如果标题噪音过大也会被舍弃（很多标题内容不明确不清晰的虽然没有踩中红线，但是处于黄线徘徊，程序不好处理，比如 进入某东的学习路线分享 不是面经，只是分享，单纯使用分词拆分 or 级匹配会归档错误数据。于是通过分层清洗，避免污染信息归档影响面经集成与后续分析）。
+
+对于格式的清洗更加严格，原来如果面经中有 ## 这种已有的文本信息被集成到 md 文档中时会扰乱原本格式，现在在归档之前会清洗一遍数据，避免污染归档。
+
+TodoList： 
+
+1. 现在跑的逻辑是先预取所有的面经，然后再筛选过滤，因为参数 max_items_per_keyword 是必须达到的目标（除非算上所有的预归档面经还不够，可以通过合理配置 max_pages 解决）。这就导致了一个问题，跑的页数越多，预取的数量也就越多，在执行大任务时会阻塞相当长时间，后续考虑添加异步优化。
+
+2. 现在的 AC 自动机的构建可以优化一下基础结构，调整词元的分组与切分，优化内存占用，如果后续性能提升不多考虑使用 cpython 或 c++ 负责 AC 自动机的构建和匹配逻辑。
+
+
