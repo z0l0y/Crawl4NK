@@ -8,7 +8,7 @@
 
 结合以上原因，打算启动一个关于这的爬虫项目。😀
 
-## 目标与成果
+## 项目目标
 
 完成最基本地爬取功能，支持三种格式的导出，如 MD，XLSX 和 TXT 格式的数据收集导出。
 
@@ -17,6 +17,29 @@
 ## 使用方式
 
 主要配置一下配置文件就可以愉快地玩耍了，本项目的参数并不复杂，这里就不一一赘述了。
+
+主要就是复制一个配置文件 config.template.json，重命名为 config.json，然后把你的 cookie 放进去。可以通过 keywords 先过滤掉一些和我们这次找面经无关的内容，max_pages 和 max_items_per_keyword 分别控制可爬取的总页数和最大爬取数量，默认是 5 和 10。
+
+output_file，output_formats 分别用于控制导出文件的前缀名和需要导出的格式有哪些。debug_log 是一个 log 开关，默认开启，建议关闭。filter_rules 是基于 keywords 的再次过滤，因为有很多广告和与面经无关的内容 --- 学习经验，offer 选择，内推信息，公司吐槽等等。通过双重过滤降低内容污染率至 5% 左右（部分帖子标题正常，但是内容是广子，这个目前也会被爬取到）。
+
+## 成果展示
+
+<div align="center">
+
+基于 Pandas 导出的高度结构化 xlsx 表格 <br>
+<img width="800" alt="xlsx效果展示" src="https://github.com/user-attachments/assets/e666e0c9-e4b0-4e4e-aa05-35fec12cca2b" />
+
+<br><br>
+
+自动生成具有良好排版阅读体验的 Markdown 文档 <br>
+<img width="800" alt="md效果展示" src="https://github.com/user-attachments/assets/84b7d7d8-646d-43ad-aed7-66821fb1c60b" />
+
+<br><br>
+
+纯净降噪、高度还原段落换行的 TXT 阅览流 <br>
+<img width="800" alt="txt效果展示" src="https://github.com/user-attachments/assets/1c64943a-0f26-4168-9627-fe818c1bd88c" />
+
+</div>
 
 ## 后续规划
 
