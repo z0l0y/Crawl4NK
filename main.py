@@ -61,12 +61,16 @@ def main():
         print("未抓取到任何符合要求的数据！请检查配置文件的关键词与过滤规则，或者您的网络、Cookie。")
         return
         
-    print(f"\n抓取完成，共提取 {len(raw_data)} 篇高质量且符合标准的面经帖子。开始进行清洗和智能打标...")
+    print(f"\n抓取完成，共获取 {len(raw_data)} 篇候选帖子。开始进行清洗和智能打标...")
     
-    processor = DataProcessor(raw_data)
+    processor = DataProcessor(raw_data, config=config)
     df = processor.process()
     
     processor.display_stats(df)
+
+    if df.empty:
+        print("清洗完成后无可归档数据（标题中未识别公司名的帖子已过滤）。")
+        return
     
     if "xlsx" in formats or "excel" in formats:
         processor.save_to_excel(df, f"{output_filename_base}.xlsx")
