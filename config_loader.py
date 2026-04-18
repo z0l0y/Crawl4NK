@@ -49,6 +49,13 @@ def _normalize_config_paths(config: Dict[str, Any]) -> Dict[str, Any]:
     companies_path = str(normalized.get("companies_path", "data/companies/companies.json") or "").strip()
     normalized["companies_path"] = _resolve_path(companies_path)
 
+    company_runtime_cache_path = str(
+        normalized.get("company_runtime_cache_path", "ENV/.cache/company_resolver_cache.json")
+        or ""
+    ).strip()
+    if company_runtime_cache_path:
+        normalized["company_runtime_cache_path"] = _resolve_path(company_runtime_cache_path)
+
     filter_rules = normalized.setdefault("filter_rules", {})
 
     pattern_cache = filter_rules.setdefault("pattern_cache", {})
@@ -56,12 +63,32 @@ def _normalize_config_paths(config: Dict[str, Any]) -> Dict[str, Any]:
     if cache_dir:
         pattern_cache["cache_dir"] = _resolve_path(cache_dir)
 
+    automaton_cache_dir = str(pattern_cache.get("automaton_cache_dir", "") or "").strip()
+    if automaton_cache_dir:
+        pattern_cache["automaton_cache_dir"] = _resolve_path(automaton_cache_dir)
+
+    automaton_watch_files = pattern_cache.get("automaton_watch_files", [])
+    if isinstance(automaton_watch_files, list):
+        pattern_cache["automaton_watch_files"] = [
+            _resolve_path(str(path).strip())
+            for path in automaton_watch_files
+            if str(path).strip()
+        ]
+
     compression_cfg = filter_rules.setdefault("char_id_compression", {})
     dict_paths = compression_cfg.get("dictionary_paths", [])
     if isinstance(dict_paths, list):
         compression_cfg["dictionary_paths"] = [
             _resolve_path(str(path).strip())
             for path in dict_paths
+            if str(path).strip()
+        ]
+
+    seed_text_paths = compression_cfg.get("seed_text_paths", [])
+    if isinstance(seed_text_paths, list):
+        compression_cfg["seed_text_paths"] = [
+            _resolve_path(str(path).strip())
+            for path in seed_text_paths
             if str(path).strip()
         ]
 

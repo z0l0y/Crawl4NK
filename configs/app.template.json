@@ -6,6 +6,9 @@
     "max_pages":  5,
     "max_items_per_keyword":  10,
     "fill_valid_quota":  false,
+    "fetch_comments_enabled":  false,
+    "include_comments_column":  false,
+    "company_must_in_list":  true,
     "output_file":  "nowcoder_data",
     "output_formats":  [
                            "xlsx",

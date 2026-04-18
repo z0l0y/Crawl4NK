@@ -2,11 +2,19 @@
     "companies_path":  "data/companies/companies.json",
     "include_id_column":  false,
     "include_algorithm_annotations":  true,
+    "include_question_outline":  false,
     "drop_unknown_company_posts":  true,
     "require_company_in_title":  true,
+    "company_must_in_list":  true,
     "company_owner_inference_enabled":  true,
     "company_owner_query_timeout":  6,
     "company_owner_max_suggestions":  12,
+    "company_cache_mode":  "reuse_then_refresh",
+    "company_runtime_cache_enabled":  true,
+    "company_runtime_cache_path":  "ENV/.cache/company_resolver_cache.json",
+    "company_cache_refresh_after_run":  true,
+    "company_cache_refresh_max_tokens":  80,
+    "company_runtime_cache_max_entries":  20000,
     "company_owner_aliases":  {
                                   "懂车帝":  "字节",
                                   "荣耀":  "字节",
@@ -29,6 +37,10 @@
     "request_read_timeout":  15,
     "request_retry_count":  2,
     "request_retry_backoff":  0.5,
+    "fetch_comments_enabled":  false,
+    "include_comments_column":  false,
+    "comment_request_min_interval_sec":  0.25,
+    "comment_request_max_interval_sec":  0.8,
     "ac_backend":  "auto",
     "ac_native_min_patterns":  64,
     "filter_rules":  {
@@ -74,13 +86,30 @@
                          "pattern_cache":  {
                                                "enabled":  false,
                                                "cache_dir":  "ENV/.cache/text_matcher",
-                                               "version":  "v1"
+                                               "version":  "v1",
+                                               "automaton_enabled":  true,
+                                               "automaton_cache_dir":  "ENV/.cache/text_matcher/automata",
+                                               "automaton_version":  "v1",
+                                               "automaton_reuse_latest_on_miss":  true,
+                                               "automaton_cleanup_enabled":  true,
+                                               "automaton_cleanup_keep_per_bucket":  1,
+                                               "automaton_watch_files":  [
+                                                                            "configs/app.json",
+                                                                            "configs/debug.json",
+                                                                            "configs/advanced.json",
+                                                                            "data/algorithms/alg.json",
+                                                                            "data/companies/companies.json"
+                                                                        ],
+                                               "automaton_debug_log":  false
                                            },
                          "char_id_compression":  {
                                                      "enabled":  true,
                                                      "dictionary_paths":  [
                                                                               "dictionaries/common_hanzi_3500.json"
                                                                           ],
+                                                     "seed_text_paths":  [
+                                                                             "data/companies/companies.json"
+                                                                         ],
                                                      "transition_strategy":  "balanced",
                                                      "allow_dynamic_extension":  true,
                                                      "use_index_field":  true,
@@ -101,6 +130,50 @@
                                               "length_max_score":  34,
                                               "short_content_chars":  420,
                                               "short_content_penalty":  18,
+                                              "structure_scoring_enabled":  true,
+                                              "structure_target_points":  8,
+                                              "structure_min_points":  3,
+                                              "structure_line_min_chars":  6,
+                                              "structure_max_score":  50,
+                                              "match_max_score":  50,
+                                              "structure_missing_penalty":  20,
+                                              "structure_noise_chars_threshold":  1000,
+                                              "structure_noise_penalty_step_chars":  240,
+                                              "structure_noise_penalty_per_step":  4,
+                                              "structure_noise_penalty_cap":  30,
+                                              "promo_block_enabled":  true,
+                                              "promo_block_min_hits":  2,
+                                              "promo_block_penalty":  45,
+                                              "promo_block_words":  [
+                                                                        "卖课",
+                                                                        "课程咨询",
+                                                                        "付费咨询",
+                                                                        "训练营",
+                                                                        "一对一辅导",
+                                                                        "简历优化",
+                                                                        "内推陪跑",
+                                                                        "求职辅导",
+                                                                        "小班课",
+                                                                        "社群答疑"
+                                                                    ],
+                                              "numbered_ad_block_enabled":  true,
+                                              "numbered_ad_follow_chars_threshold":  80,
+                                              "numbered_ad_follow_lines_threshold":  1,
+                                              "numbered_ad_block_min_items":  2,
+                                              "numbered_ad_block_ratio":  0.5,
+                                              "numbered_ad_penalty":  40,
+                                              "numbered_ad_marker_block_hits":  3,
+                                              "numbered_ad_markers":  [
+                                                                           "答：",
+                                                                           "回答思路",
+                                                                           "例如",
+                                                                           "举例",
+                                                                           "面试官",
+                                                                           "这个问题",
+                                                                           "比较好的回答方式",
+                                                                           "重点放在",
+                                                                           "你可以这样回答"
+                                                                       ],
                                               "default_keyword_weight":  6,
                                               "weighted_keyword_max_score":  44,
                                               "weighted_keywords":  [
@@ -189,6 +262,14 @@
                                               "parallel_workers":  4,
                                               "parallel_batch_size":  8,
                                               "async_build":  true,
+                                              "heap_selection_enabled":  true,
+                                              "heap_pool_multiplier":  1.5,
+                                              "heap_max_pool":  0,
+                                              "heap_elastic_enabled":  true,
+                                              "heap_elastic_max_multiplier":  2.2,
+                                              "heap_elastic_step_ratio":  0.25,
+                                              "heap_elastic_replace_threshold":  6,
+                                              "heap_elastic_shrink_idle_rounds":  3,
                                               "debug_log":  false
                                           }
                      }

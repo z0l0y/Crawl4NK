@@ -3,11 +3,14 @@ from concurrent.futures import ThreadPoolExecutor
 from array import array
 from bisect import bisect_left
 import hashlib
+import html
 import json
 import logging
 import math
 import os
+import pickle
 import re
+import sys
 import threading
 import unicodedata
 
@@ -936,6 +939,7 @@ class WeightedScoringAutomaton:
 class TextMatcher:
     _DEFAULT_SKIP_ALLOWED_CHARS = " \t\r\n-_/|,，.。·!！?？:：;；~`'\"()[]{}<>*+&^%$#@"
     _DEFAULT_CACHE_DIR = os.path.join("ENV", ".cache", "text_matcher")
+    _DEFAULT_AUTOMATON_CACHE_DIR = os.path.join(_DEFAULT_CACHE_DIR, "automata")
     _DEFAULT_CHAR_ID_DICT_PATHS = [
         os.path.join("dictionaries", "common_hanzi_3500.json"),
     ]
@@ -1005,6 +1009,34 @@ class TextMatcher:
         "题解",
         "coding interview",
     ]
+    _HTML_BREAK_TAG_RE = re.compile(r"<\s*(?:br|/p|/div|/li|/tr|/h[1-6]|/blockquote)\b[^>]*>", re.IGNORECASE)
+    _HTML_TAG_RE = re.compile(r"<[^>]+>")
+    _URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+    _NUMBERED_ITEM_LINE_RE = re.compile(r"^\s*(\d{1,2})\s*[\.．、\)\]）]\s*(.{2,280})\s*$")
+    _DEFAULT_PROMO_BLOCK_WORDS = [
+        "卖课",
+        "课程咨询",
+        "付费咨询",
+        "训练营",
+        "一对一辅导",
+        "简历优化",
+        "内推陪跑",
+        "求职辅导",
+        "小班课",
+        "社群答疑",
+    ]
+    _DEFAULT_NUMBERED_AD_MARKERS = [
+        "答：",
+        "答:",
+        "回答思路",
+        "例如",
+        "举例",
+        "面试官",
+        "这个问题",
+        "比较好的回答方式",
+        "重点放在",
+        "你可以这样回答",
+    ]
 
     def __init__(
         self,
@@ -1021,12 +1053,14 @@ class TextMatcher:
     ):
         self._init_normalization(normalization)
         self._init_pattern_cache(pattern_cache)
+        self._init_automaton_cache(pattern_cache)
         self._init_char_id_compression(char_id_compression)
 
         self._build_lock = threading.Lock()
         self._builder_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="matcher-build")
         self._scoring_automaton_future = None
         self._scoring_automaton = None
+        self._scoring_automaton_cache_path = None
         self._scoring_automaton_ready = False
         self._scoring_category_index = {}
         self._quality_executor = None
@@ -1050,7 +1084,10 @@ class TextMatcher:
         self.backend = (backend or "auto").strip().lower()
         self.native_min_patterns = max(int(native_min_patterns or 1), 1)
         self.matcher = None
-        self.allow_override_matcher = self._build_allow_override_matcher(self.allow_overrides)
+        self.allow_override_matcher = self._build_allow_override_matcher(
+            self.allow_overrides,
+            cache_bucket="allow_override",
+        )
         self.skip_matcher = None
         self.title_force_patterns = []
         self.title_force_matcher = None
@@ -1081,7 +1118,7 @@ class TextMatcher:
             logging.info(f"初始化 KMP 机制，当前加载关键字: {self.patterns}")
 
         elif not single_patterns and len(multi_patterns) > 1:
-            native_matcher = self._try_build_native_matcher(multi_patterns)
+            native_matcher = self._try_build_native_matcher(multi_patterns, cache_bucket="main_native")
             if native_matcher is not None:
                 self.matcher = native_matcher
                 self.algo_name = "AC Native"
@@ -1089,19 +1126,50 @@ class TextMatcher:
                     f"初始化 AC 原生后端(pyahocorasick)。关键字数量: {len(self.patterns)}"
                 )
             else:
-                self.matcher = ACAhoCorasick(
-                    multi_patterns,
-                    codec=self._create_char_id_codec(),
-                    transition_strategy=self.char_id_transition_strategy,
+                payload = {
+                    "kind": "main_ac_python",
+                    "version": self.automaton_cache_version,
+                    "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+                    "patterns": multi_patterns,
+                    "transition_strategy": self.char_id_transition_strategy,
+                    "char_id_enabled": self.char_id_enabled,
+                    "char_id_allow_dynamic": self.char_id_allow_dynamic,
+                    "char_id_use_index_field": self.char_id_use_index_field,
+                    "dependencies": self._collect_automaton_dependency_snapshots(),
+                }
+                self.matcher = self._build_or_load_cached_automaton(
+                    "main_ac_python",
+                    payload,
+                    lambda: ACAhoCorasick(
+                        multi_patterns,
+                        codec=self._create_char_id_codec(),
+                        transition_strategy=self.char_id_transition_strategy,
+                    ),
                 )
                 self.algo_name = "AC Automaton"
                 logging.info(f"初始化 AC 自动机机制。关键字数量: {len(self.patterns)}")
         else:
-            self.matcher = HybridMatcher(
-                single_patterns,
-                multi_patterns,
-                ac_codec=self._create_char_id_codec(),
-                transition_strategy=self.char_id_transition_strategy,
+            payload = {
+                "kind": "main_hybrid",
+                "version": self.automaton_cache_version,
+                "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "single_patterns": single_patterns,
+                "multi_patterns": multi_patterns,
+                "transition_strategy": self.char_id_transition_strategy,
+                "char_id_enabled": self.char_id_enabled,
+                "char_id_allow_dynamic": self.char_id_allow_dynamic,
+                "char_id_use_index_field": self.char_id_use_index_field,
+                "dependencies": self._collect_automaton_dependency_snapshots(),
+            }
+            self.matcher = self._build_or_load_cached_automaton(
+                "main_hybrid",
+                payload,
+                lambda: HybridMatcher(
+                    single_patterns,
+                    multi_patterns,
+                    ac_codec=self._create_char_id_codec(),
+                    transition_strategy=self.char_id_transition_strategy,
+                ),
             )
             self.algo_name = "Hybrid"
             logging.info(
@@ -1129,6 +1197,289 @@ class TextMatcher:
             self.pattern_cache_enabled = False
             logging.warning(f"模式缓存目录创建失败，已禁用缓存: {e}")
 
+    def _init_automaton_cache(self, pattern_cache: dict | None):
+        cfg = pattern_cache if isinstance(pattern_cache, dict) else {}
+        self.automaton_cache_enabled = bool(cfg.get("automaton_enabled", True))
+        self.automaton_cache_version = str(cfg.get("automaton_version", "v1") or "v1")
+        self.automaton_cache_debug_log = bool(cfg.get("automaton_debug_log", False))
+        self.automaton_reuse_latest_on_miss = bool(cfg.get("automaton_reuse_latest_on_miss", True))
+        self.automaton_cleanup_enabled = bool(cfg.get("automaton_cleanup_enabled", True))
+        self.automaton_cleanup_keep_per_bucket = max(
+            int(cfg.get("automaton_cleanup_keep_per_bucket", 1) or 1),
+            1,
+        )
+
+        cache_dir = str(cfg.get("automaton_cache_dir", "") or "").strip()
+        if not cache_dir:
+            if self.pattern_cache_dir:
+                cache_dir = os.path.join(self.pattern_cache_dir, "automata")
+            else:
+                cache_dir = self._DEFAULT_AUTOMATON_CACHE_DIR
+        if not os.path.isabs(cache_dir):
+            cache_dir = os.path.join(os.getcwd(), cache_dir)
+        self.automaton_cache_dir = os.path.normpath(cache_dir)
+
+        watch_files = cfg.get("automaton_watch_files", [])
+        if isinstance(watch_files, str):
+            watch_files = [watch_files]
+        if not isinstance(watch_files, (list, tuple)):
+            watch_files = []
+
+        normalized_watch = []
+        seen = set()
+        for path_item in watch_files:
+            raw = str(path_item or "").strip()
+            if not raw:
+                continue
+            resolved = raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
+            normalized = os.path.normpath(resolved)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            normalized_watch.append(normalized)
+        self.automaton_watch_files = normalized_watch
+
+        if not self.automaton_cache_enabled:
+            return
+
+        try:
+            os.makedirs(self.automaton_cache_dir, exist_ok=True)
+            self._cleanup_automaton_cache_directory()
+        except Exception as e:
+            self.automaton_cache_enabled = False
+            logging.warning(f"自动机缓存目录创建失败，已禁用自动机缓存: {e}")
+
+    @staticmethod
+    def _safe_file_snapshot(path: str) -> dict:
+        token = os.path.normpath(str(path or "").strip())
+        if not token:
+            return {
+                "path": "",
+                "exists": False,
+                "size": 0,
+                "mtime_ns": 0,
+            }
+
+        try:
+            stat = os.stat(token)
+            mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+            return {
+                "path": token,
+                "exists": True,
+                "size": int(stat.st_size),
+                "mtime_ns": mtime_ns,
+            }
+        except Exception:
+            return {
+                "path": token,
+                "exists": False,
+                "size": 0,
+                "mtime_ns": 0,
+            }
+
+    def _collect_automaton_dependency_snapshots(self, extra_paths=None) -> list:
+        paths = []
+        seen = set()
+
+        for path_item in self.char_id_dictionary_paths:
+            token = os.path.normpath(str(path_item or "").strip())
+            if token and token not in seen:
+                seen.add(token)
+                paths.append(token)
+
+        for path_item in getattr(self, "char_id_seed_text_paths", []):
+            token = os.path.normpath(str(path_item or "").strip())
+            if token and token not in seen:
+                seen.add(token)
+                paths.append(token)
+
+        for path_item in self.automaton_watch_files:
+            token = os.path.normpath(str(path_item or "").strip())
+            if token and token not in seen:
+                seen.add(token)
+                paths.append(token)
+
+        for path_item in (extra_paths or []):
+            token = os.path.normpath(str(path_item or "").strip())
+            if token and token not in seen:
+                seen.add(token)
+                paths.append(token)
+
+        return [self._safe_file_snapshot(path) for path in paths]
+
+    def _build_automaton_cache_path(self, cache_bucket: str, payload: dict) -> str:
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        return os.path.join(self.automaton_cache_dir, f"{cache_bucket}_{digest}.pkl")
+
+    @staticmethod
+    def _extract_automaton_cache_bucket(file_name: str) -> str:
+        token = str(file_name or "").strip()
+        match = re.match(r"^(.+)_([0-9a-f]{64})\.pkl$", token)
+        if not match:
+            return ""
+        return str(match.group(1) or "")
+
+    def _list_bucket_automaton_cache_files(self, cache_bucket: str) -> list:
+        if not self.automaton_cache_enabled:
+            return []
+
+        bucket_token = str(cache_bucket or "").strip()
+        if not bucket_token:
+            return []
+
+        prefix = f"{bucket_token}_"
+        files = []
+
+        try:
+            for file_name in os.listdir(self.automaton_cache_dir):
+                if not file_name.startswith(prefix) or not file_name.endswith(".pkl"):
+                    continue
+                full_path = os.path.join(self.automaton_cache_dir, file_name)
+                try:
+                    stat = os.stat(full_path)
+                    mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+                except Exception:
+                    mtime_ns = 0
+                files.append((full_path, mtime_ns))
+        except Exception as e:
+            if self.automaton_cache_debug_log:
+                logging.info(f"自动机缓存目录扫描失败(可忽略): {e}")
+            return []
+
+        files.sort(key=lambda item: item[1], reverse=True)
+        return files
+
+    def _load_latest_bucket_cached_automaton(self, cache_bucket: str, exclude_paths=None):
+        if not self.automaton_cache_enabled or (not self.automaton_reuse_latest_on_miss):
+            return "", None
+
+        excluded = {
+            os.path.normpath(str(path_item or "").strip())
+            for path_item in (exclude_paths or [])
+            if str(path_item or "").strip()
+        }
+
+        for cache_path, _ in self._list_bucket_automaton_cache_files(cache_bucket):
+            normalized = os.path.normpath(cache_path)
+            if normalized in excluded:
+                continue
+
+            cache_hit, cached = self._load_cached_automaton(cache_path)
+            if cache_hit:
+                return cache_path, cached
+
+        return "", None
+
+    def _cleanup_automaton_bucket_cache(self, cache_bucket: str, keep_paths=None):
+        if not self.automaton_cache_enabled or (not self.automaton_cleanup_enabled):
+            return
+
+        files = self._list_bucket_automaton_cache_files(cache_bucket)
+        if not files:
+            return
+
+        keep_targets = []
+        keep_seen = set()
+
+        for path_item in (keep_paths or []):
+            token = os.path.normpath(str(path_item or "").strip())
+            if not token or token in keep_seen:
+                continue
+            keep_seen.add(token)
+            keep_targets.append(token)
+
+        keep_limit = max(self.automaton_cleanup_keep_per_bucket, 1)
+        if len(keep_targets) < keep_limit:
+            for cache_path, _ in files:
+                token = os.path.normpath(cache_path)
+                if token in keep_seen:
+                    continue
+                keep_seen.add(token)
+                keep_targets.append(token)
+                if len(keep_targets) >= keep_limit:
+                    break
+
+        keep_set = set(keep_targets)
+        removed_count = 0
+        for cache_path, _ in files:
+            token = os.path.normpath(cache_path)
+            if token in keep_set:
+                continue
+            try:
+                os.remove(cache_path)
+                removed_count += 1
+            except Exception:
+                continue
+
+        if removed_count > 0 and self.automaton_cache_debug_log:
+            logging.info(f"自动机缓存清理: bucket={cache_bucket}, removed={removed_count}")
+
+    def _cleanup_automaton_cache_directory(self):
+        if not self.automaton_cache_enabled or (not self.automaton_cleanup_enabled):
+            return
+
+        grouped_buckets = set()
+        try:
+            for file_name in os.listdir(self.automaton_cache_dir):
+                if not file_name.endswith(".pkl"):
+                    continue
+                bucket = self._extract_automaton_cache_bucket(file_name)
+                if bucket:
+                    grouped_buckets.add(bucket)
+        except Exception as e:
+            if self.automaton_cache_debug_log:
+                logging.info(f"自动机缓存目录预清理失败(可忽略): {e}")
+            return
+
+        for bucket in grouped_buckets:
+            self._cleanup_automaton_bucket_cache(bucket)
+
+    def _load_cached_automaton(self, cache_path: str):
+        try:
+            with open(cache_path, "rb") as f:
+                data = pickle.load(f)
+            return True, data
+        except Exception:
+            return False, None
+
+    def _save_cached_automaton(self, cache_path: str, automaton_obj):
+        try:
+            with open(cache_path, "wb") as f:
+                pickle.dump(automaton_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+            if self.automaton_cache_debug_log:
+                logging.info(f"自动机缓存写入失败(可忽略): {e}")
+
+    def _build_or_load_cached_automaton(self, cache_bucket: str, payload: dict, builder):
+        if not self.automaton_cache_enabled:
+            return builder()
+
+        cache_path = self._build_automaton_cache_path(cache_bucket, payload)
+        cache_hit, cached = self._load_cached_automaton(cache_path)
+        if cache_hit:
+            if self.automaton_cache_debug_log:
+                logging.info(f"自动机缓存命中: {cache_bucket}")
+            self._cleanup_automaton_bucket_cache(cache_bucket, keep_paths=[cache_path])
+            return cached
+
+        fallback_path, fallback_cached = self._load_latest_bucket_cached_automaton(
+            cache_bucket,
+            exclude_paths=[cache_path],
+        )
+        if fallback_cached is not None:
+            if self.automaton_cache_debug_log:
+                logging.info(f"自动机缓存复用上次版本: {cache_bucket}")
+            self._cleanup_automaton_bucket_cache(cache_bucket, keep_paths=[fallback_path])
+            return fallback_cached
+
+        built = builder()
+        self._save_cached_automaton(cache_path, built)
+        self._cleanup_automaton_bucket_cache(cache_bucket, keep_paths=[cache_path])
+        if self.automaton_cache_debug_log:
+            logging.info(f"自动机缓存写入: {cache_bucket}")
+        return built
+
     def _init_char_id_compression(self, char_id_compression: dict | None):
         cfg = char_id_compression if isinstance(char_id_compression, dict) else {}
         self.char_id_enabled = bool(cfg.get("enabled", True))
@@ -1151,6 +1502,12 @@ class TextMatcher:
         elif not isinstance(configured_paths, (list, tuple)):
             configured_paths = list(self._DEFAULT_CHAR_ID_DICT_PATHS)
 
+        configured_seed_paths = cfg.get("seed_text_paths", [])
+        if isinstance(configured_seed_paths, str):
+            configured_seed_paths = [configured_seed_paths]
+        elif not isinstance(configured_seed_paths, (list, tuple)):
+            configured_seed_paths = []
+
         normalized_paths = []
         seen_paths = set()
         for path_item in configured_paths:
@@ -1165,11 +1522,55 @@ class TextMatcher:
             normalized_paths.append(normalized)
 
         self.char_id_dictionary_paths = normalized_paths
+        normalized_seed_paths = []
+        seen_seed_paths = set()
+        for path_item in configured_seed_paths:
+            raw = str(path_item or "").strip()
+            if not raw:
+                continue
+            resolved = raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
+            normalized = os.path.normpath(resolved)
+            if normalized in seen_seed_paths:
+                continue
+            seen_seed_paths.add(normalized)
+            normalized_seed_paths.append(normalized)
+
+        self.char_id_seed_text_paths = normalized_seed_paths
         self.char_id_base_mapping = {}
         self.char_id_loaded_paths = []
 
         if not self.char_id_enabled:
             return
+
+        mapping_cache_path = self._build_char_id_mapping_cache_path()
+        mapping_cache_hit, mapping_cache = self._load_char_id_mapping_cache(mapping_cache_path)
+        if mapping_cache_hit and isinstance(mapping_cache, dict):
+            cached_mapping = mapping_cache.get("mapping", {})
+            if isinstance(cached_mapping, dict):
+                restored = {}
+                for raw_ch, raw_id in cached_mapping.items():
+                    ch = str(raw_ch or "")
+                    if len(ch) != 1:
+                        continue
+                    try:
+                        parsed_id = int(raw_id)
+                    except Exception:
+                        continue
+                    if parsed_id <= 0:
+                        continue
+                    restored[ch] = parsed_id
+
+                if restored:
+                    loaded_paths = mapping_cache.get("loaded_paths", [])
+                    if not isinstance(loaded_paths, list):
+                        loaded_paths = []
+                    self.char_id_base_mapping = restored
+                    self.char_id_loaded_paths = [str(path).strip() for path in loaded_paths if str(path).strip()]
+                    if self.char_id_debug_log:
+                        logging.info(
+                            f"字符ID映射缓存命中。加载字符数: {len(self.char_id_base_mapping)}，来源文件数: {len(self.char_id_loaded_paths)}"
+                        )
+                    return
 
         mapping = {}
         next_id = 1
@@ -1182,7 +1583,26 @@ class TextMatcher:
             if loaded:
                 self.char_id_loaded_paths.append(dict_path)
 
+        for seed_path in self.char_id_seed_text_paths:
+            mapping, next_id, loaded = self._load_char_id_seed_chars_from_file(
+                seed_path,
+                mapping,
+                next_id,
+            )
+            if loaded:
+                self.char_id_loaded_paths.append(seed_path)
+
         self.char_id_base_mapping = mapping
+
+        if self.char_id_base_mapping:
+            self._save_char_id_mapping_cache(
+                mapping_cache_path,
+                {
+                    "mapping": self.char_id_base_mapping,
+                    "loaded_paths": self.char_id_loaded_paths,
+                },
+            )
+
         if self.char_id_base_mapping:
             if self.char_id_debug_log:
                 logging.info(
@@ -1274,6 +1694,113 @@ class TextMatcher:
 
         return merged, local_next_id, True
 
+    def _build_char_id_mapping_cache_path(self) -> str:
+        if not self.automaton_cache_enabled:
+            return ""
+
+        payload = {
+            "kind": "char_id_mapping",
+            "version": self.automaton_cache_version,
+            "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "char_id_enabled": self.char_id_enabled,
+            "char_id_allow_dynamic": self.char_id_allow_dynamic,
+            "char_id_use_index_field": self.char_id_use_index_field,
+            "dictionary_files": self._collect_automaton_dependency_snapshots(self.char_id_dictionary_paths),
+            "seed_files": self._collect_automaton_dependency_snapshots(self.char_id_seed_text_paths),
+        }
+        return self._build_automaton_cache_path("char_id_mapping", payload)
+
+    def _load_char_id_mapping_cache(self, cache_path: str):
+        if not cache_path:
+            return False, None
+
+        cache_hit, cached = self._load_cached_automaton(cache_path)
+        if cache_hit:
+            self._cleanup_automaton_bucket_cache("char_id_mapping", keep_paths=[cache_path])
+            return True, cached
+
+        fallback_path, fallback_cached = self._load_latest_bucket_cached_automaton(
+            "char_id_mapping",
+            exclude_paths=[cache_path],
+        )
+        if fallback_cached is not None:
+            if self.automaton_cache_debug_log:
+                logging.info("字符ID映射缓存复用上次版本。")
+            self._cleanup_automaton_bucket_cache("char_id_mapping", keep_paths=[fallback_path])
+            return True, fallback_cached
+
+        return False, None
+
+    def _save_char_id_mapping_cache(self, cache_path: str, payload: dict):
+        if not cache_path:
+            return
+        self._save_cached_automaton(cache_path, payload)
+        self._cleanup_automaton_bucket_cache("char_id_mapping", keep_paths=[cache_path])
+
+    def _load_char_id_seed_chars_from_file(self, file_path: str, current_mapping: dict, next_id: int):
+        if not os.path.exists(file_path):
+            return current_mapping, next_id, False
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw_text = f.read()
+        except Exception:
+            return current_mapping, next_id, False
+
+        texts = []
+        try:
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, str):
+                        texts.append(item)
+                    elif isinstance(item, dict):
+                        for value in item.values():
+                            if isinstance(value, str):
+                                texts.append(value)
+            elif isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    if isinstance(key, str):
+                        texts.append(key)
+                    if isinstance(value, str):
+                        texts.append(value)
+                    elif isinstance(value, list):
+                        for sub_item in value:
+                            if isinstance(sub_item, str):
+                                texts.append(sub_item)
+        except Exception:
+            for line in raw_text.splitlines():
+                stripped = line.strip()
+                if stripped:
+                    texts.append(stripped)
+
+        if not texts:
+            return current_mapping, next_id, False
+
+        merged = dict(current_mapping)
+        used_ids = set(merged.values())
+        local_next_id = max(used_ids) + 1 if used_ids else max(int(next_id or 1), 1)
+
+        for text_item in texts:
+            token = str(text_item or "")
+            if not token:
+                continue
+
+            for ch in token:
+                if not ch.strip() or ch in merged:
+                    continue
+
+                while local_next_id in used_ids:
+                    local_next_id += 1
+                merged[ch] = local_next_id
+                used_ids.add(local_next_id)
+                local_next_id += 1
+
+        if used_ids:
+            local_next_id = max(local_next_id, max(used_ids) + 1)
+
+        return merged, local_next_id, True
+
     def _create_char_id_codec(self):
         if not self.char_id_enabled:
             return CharacterIdCodec()
@@ -1357,7 +1884,10 @@ class TextMatcher:
             split_tokens=False,
             cache_bucket="title_force",
         )
-        self.title_force_matcher = self._build_allow_override_matcher(self.title_force_patterns)
+        self.title_force_matcher = self._build_allow_override_matcher(
+            self.title_force_patterns,
+            cache_bucket="title_force",
+        )
 
         self.content_combine_patterns = self._prepare_patterns(
             cfg.get("content_combine_contains", []),
@@ -1416,6 +1946,65 @@ class TextMatcher:
         self.score_short_content_chars = max(int(cfg.get("short_content_chars", 420) or 420), 0)
         self.score_short_content_penalty = max(int(cfg.get("short_content_penalty", 18) or 18), 0)
 
+        self.score_structure_enabled = bool(cfg.get("structure_scoring_enabled", True))
+        self.score_structure_target_points = max(int(cfg.get("structure_target_points", 8) or 8), 1)
+        self.score_structure_min_points = max(int(cfg.get("structure_min_points", 3) or 3), 0)
+        self.score_structure_line_min_chars = max(int(cfg.get("structure_line_min_chars", 6) or 6), 1)
+        self.score_structure_max_score = max(int(cfg.get("structure_max_score", 50) or 50), 0)
+        self.score_match_max_score = max(int(cfg.get("match_max_score", 50) or 50), 0)
+        if self.score_structure_max_score == 0 and self.score_match_max_score == 0:
+            self.score_structure_max_score = 50
+            self.score_match_max_score = 50
+        self.score_structure_missing_penalty = max(int(cfg.get("structure_missing_penalty", 20) or 20), 0)
+        self.score_structure_noise_chars_threshold = max(
+            int(cfg.get("structure_noise_chars_threshold", 1000) or 1000),
+            0,
+        )
+        self.score_structure_noise_penalty_step_chars = max(
+            int(cfg.get("structure_noise_penalty_step_chars", 240) or 240),
+            1,
+        )
+        self.score_structure_noise_penalty_per_step = max(
+            int(cfg.get("structure_noise_penalty_per_step", 4) or 4),
+            0,
+        )
+        self.score_structure_noise_penalty_cap = max(
+            int(cfg.get("structure_noise_penalty_cap", 30) or 30),
+            0,
+        )
+
+        self.score_promo_block_enabled = bool(cfg.get("promo_block_enabled", True))
+        self.score_promo_block_min_hits = max(int(cfg.get("promo_block_min_hits", 2) or 2), 1)
+        self.score_promo_block_penalty = max(int(cfg.get("promo_block_penalty", 45) or 45), 0)
+        promo_block_words_cfg = cfg.get("promo_block_words", self._DEFAULT_PROMO_BLOCK_WORDS)
+        self.score_promo_block_words = self._normalize_unique_strings(promo_block_words_cfg, min_len=2)
+
+        self.score_numbered_ad_block_enabled = bool(cfg.get("numbered_ad_block_enabled", True))
+        self.score_numbered_ad_follow_chars_threshold = max(
+            int(cfg.get("numbered_ad_follow_chars_threshold", 120) or 120),
+            20,
+        )
+        self.score_numbered_ad_follow_lines_threshold = max(
+            int(cfg.get("numbered_ad_follow_lines_threshold", 2) or 2),
+            1,
+        )
+        self.score_numbered_ad_block_min_items = max(
+            int(cfg.get("numbered_ad_block_min_items", 2) or 2),
+            1,
+        )
+        try:
+            numbered_ad_ratio = float(cfg.get("numbered_ad_block_ratio", 0.5) or 0.5)
+        except Exception:
+            numbered_ad_ratio = 0.5
+        self.score_numbered_ad_block_ratio = min(max(numbered_ad_ratio, 0.2), 1.0)
+        self.score_numbered_ad_penalty = max(int(cfg.get("numbered_ad_penalty", 40) or 40), 0)
+        self.score_numbered_ad_marker_block_hits = max(
+            int(cfg.get("numbered_ad_marker_block_hits", 3) or 3),
+            1,
+        )
+        numbered_ad_markers_cfg = cfg.get("numbered_ad_markers", self._DEFAULT_NUMBERED_AD_MARKERS)
+        self.score_numbered_ad_markers = self._normalize_unique_strings(numbered_ad_markers_cfg, min_len=2)
+
         self.score_default_keyword_weight = max(int(cfg.get("default_keyword_weight", 6) or 6), 1)
         self.score_weighted_keyword_cap = max(int(cfg.get("weighted_keyword_max_score", 44) or 44), 0)
         weighted_keywords_cfg = cfg.get("weighted_keywords", self._DEFAULT_SCORE_KEYWORDS)
@@ -1466,7 +2055,10 @@ class TextMatcher:
             split_tokens=False,
             cache_bucket="alg_markers",
         )
-        self.alg_marker_matcher = self._build_allow_override_matcher(self.alg_marker_patterns)
+        self.alg_marker_matcher = self._build_allow_override_matcher(
+            self.alg_marker_patterns,
+            cache_bucket="alg_markers",
+        )
         self.alg_topic_patterns = []
         self.alg_topic_matcher = None
         self.alg_problem_patterns = []
@@ -1490,7 +2082,7 @@ class TextMatcher:
 
         if self.score_enabled:
             logging.info(
-                f"启用质量评分过滤。阈值: {self.score_threshold}，长度/匹配配比: {self.score_length_weight}/{self.score_match_weight}，加权关键词: {len(self.score_weighted_keywords)}，标签惩罚词: {len(self.score_tail_drain_word_penalties)}，算法词库: {len(self.alg_problem_patterns)} 题/{len(self.alg_topic_patterns)} 类，面试高频: {len(self.alg_hot_problem_entries)} 条，并行评分线程: {self.score_parallel_workers}，异步构建: {self.score_async_build}"
+                f"启用质量评分过滤。阈值: {self.score_threshold}，结构评分: {self.score_structure_enabled}(上限:{self.score_structure_max_score})，匹配上限:{self.score_match_max_score}，旧长度/匹配配比: {self.score_length_weight}/{self.score_match_weight}，卖课拦截: {self.score_promo_block_enabled}，编号广告拦截: {self.score_numbered_ad_block_enabled}，加权关键词: {len(self.score_weighted_keywords)}，标签惩罚词: {len(self.score_tail_drain_word_penalties)}，算法词库: {len(self.alg_problem_patterns)} 题/{len(self.alg_topic_patterns)} 类，面试高频: {len(self.alg_hot_problem_entries)} 条，并行评分线程: {self.score_parallel_workers}，异步构建: {self.score_async_build}"
             )
 
     def _prepare_weighted_keywords(self, weighted_keywords) -> list:
@@ -1823,10 +2415,25 @@ class TextMatcher:
             index.setdefault(category, []).append(idx)
         return index
 
+    def _build_scoring_automaton_cache_payload(self, feature_specs: list) -> dict:
+        return {
+            "kind": "weighted_scoring_automaton",
+            "version": self.automaton_cache_version,
+            "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "transition_strategy": self.char_id_transition_strategy,
+            "char_id_enabled": self.char_id_enabled,
+            "char_id_allow_dynamic": self.char_id_allow_dynamic,
+            "char_id_use_index_field": self.char_id_use_index_field,
+            "score_async_build": self.score_async_build,
+            "feature_specs": feature_specs,
+            "dependencies": self._collect_automaton_dependency_snapshots([self.score_alg_path]),
+        }
+
     def _start_scoring_automaton_build(self):
         feature_specs = self._build_scoring_feature_specs()
         self._scoring_category_index = self._build_scoring_category_index(feature_specs)
         scoring_codec = self._create_char_id_codec()
+        self._scoring_automaton_cache_path = None
 
         if not feature_specs:
             self._scoring_automaton = None
@@ -1837,6 +2444,36 @@ class TextMatcher:
         self._scoring_automaton = None
         self._scoring_automaton_ready = False
 
+        if self.automaton_cache_enabled:
+            cache_payload = self._build_scoring_automaton_cache_payload(feature_specs)
+            cache_path = self._build_automaton_cache_path("scoring_automaton", cache_payload)
+            cache_hit, cached_automaton = self._load_cached_automaton(cache_path)
+            if cache_hit and isinstance(cached_automaton, WeightedScoringAutomaton):
+                self._scoring_automaton = cached_automaton
+                self._scoring_automaton_future = None
+                self._scoring_automaton_ready = True
+                self._scoring_automaton_cache_path = cache_path
+                self._cleanup_automaton_bucket_cache("scoring_automaton", keep_paths=[cache_path])
+                if self.automaton_cache_debug_log:
+                    logging.info("打分自动机缓存命中，跳过构建。")
+                return
+
+            fallback_path, fallback_cached = self._load_latest_bucket_cached_automaton(
+                "scoring_automaton",
+                exclude_paths=[cache_path],
+            )
+            if isinstance(fallback_cached, WeightedScoringAutomaton):
+                self._scoring_automaton = fallback_cached
+                self._scoring_automaton_future = None
+                self._scoring_automaton_ready = True
+                self._scoring_automaton_cache_path = fallback_path
+                self._cleanup_automaton_bucket_cache("scoring_automaton", keep_paths=[fallback_path])
+                if self.automaton_cache_debug_log:
+                    logging.info("打分自动机缓存复用上次版本，跳过构建。")
+                return
+
+            self._scoring_automaton_cache_path = cache_path
+
         if not self.score_async_build:
             try:
                 self._scoring_automaton = WeightedScoringAutomaton(
@@ -1845,6 +2482,12 @@ class TextMatcher:
                     transition_strategy=self.char_id_transition_strategy,
                 )
                 self._scoring_automaton_ready = True
+                if self.automaton_cache_enabled and self._scoring_automaton_cache_path:
+                    self._save_cached_automaton(self._scoring_automaton_cache_path, self._scoring_automaton)
+                    self._cleanup_automaton_bucket_cache(
+                        "scoring_automaton",
+                        keep_paths=[self._scoring_automaton_cache_path],
+                    )
             except Exception as e:
                 logging.warning(f"打分自动机构建失败，已回退普通评分路径: {e}")
                 self._scoring_automaton = None
@@ -1881,11 +2524,18 @@ class TextMatcher:
                 self._scoring_automaton_future = None
                 self._scoring_automaton = None
                 self._scoring_automaton_ready = False
+                self._scoring_automaton_cache_path = None
                 return False
 
             self._scoring_automaton = automaton
             self._scoring_automaton_ready = True
             self._scoring_automaton_future = None
+            if self.automaton_cache_enabled and self._scoring_automaton_cache_path:
+                self._save_cached_automaton(self._scoring_automaton_cache_path, automaton)
+                self._cleanup_automaton_bucket_cache(
+                    "scoring_automaton",
+                    keep_paths=[self._scoring_automaton_cache_path],
+                )
             logging.info("异步打分自动机构建完成。")
             return True
 
@@ -1895,6 +2545,13 @@ class TextMatcher:
         if self._scoring_automaton is None:
             return {}
         return self._scoring_automaton.search_with_counts(text or "")
+
+    def is_scoring_automaton_building(self) -> bool:
+        future = self._scoring_automaton_future
+        return bool(self.score_enabled and future is not None and (not future.done()))
+
+    def is_scoring_automaton_ready(self) -> bool:
+        return bool(self._scoring_automaton_ready and self._scoring_automaton is not None)
 
     def _evaluate_weighted_keywords_via_automaton(self, normalized_title: str, normalized_content: str):
         if not self.score_weighted_keywords:
@@ -2132,7 +2789,7 @@ class TextMatcher:
 
     def _build_matcher_from_raw_patterns(self, patterns, cache_bucket: str = "default"):
         prepared_patterns = self._prepare_patterns(patterns or [], split_tokens=False, cache_bucket=cache_bucket)
-        return prepared_patterns, self._build_allow_override_matcher(prepared_patterns)
+        return prepared_patterns, self._build_allow_override_matcher(prepared_patterns, cache_bucket=cache_bucket)
 
     def _load_alg_library(self, file_path: str) -> dict:
         if not file_path or not os.path.exists(file_path):
@@ -2160,7 +2817,10 @@ class TextMatcher:
         marker_candidates = list(self.alg_marker_patterns)
         marker_candidates.extend(alg_data.get("markers", []))
         self.alg_marker_patterns = self._normalize_unique_strings(marker_candidates, min_len=2)
-        self.alg_marker_matcher = self._build_allow_override_matcher(self.alg_marker_patterns)
+        self.alg_marker_matcher = self._build_allow_override_matcher(
+            self.alg_marker_patterns,
+            cache_bucket="alg_markers",
+        )
 
         topic_candidates = []
         topic_candidates.extend(alg_data.get("categories", []))
@@ -2191,7 +2851,10 @@ class TextMatcher:
             compacted_map[compacted] = title
 
         self.alg_problem_compacted_patterns = compacted_patterns
-        self.alg_problem_compacted_matcher = self._build_allow_override_matcher(compacted_patterns)
+        self.alg_problem_compacted_matcher = self._build_allow_override_matcher(
+            compacted_patterns,
+            cache_bucket="alg_problem_compacted",
+        )
         self.alg_problem_compacted_map = compacted_map
 
         ids = set()
@@ -2328,15 +2991,23 @@ class TextMatcher:
             return set()
 
         hits = set()
-        for match in re.finditer(r"(?<!\d)(\d{1,4})(?:(?:\s*[\.．、\)])|(?:\s*题)|(?=\s|$|[，。；;,:：!！?？#]))", text):
-            try:
-                value = int(match.group(1))
-            except Exception:
-                continue
-            if value in self.alg_problem_ids:
-                hits.add(value)
+        explicit_id_patterns = [
+            r"(?:第\s*|题号\s*[:：]?\s*)(\d{1,4})\s*题?",
+            r"(?<!\d)(\d{1,4})\s*题(?!\d)",
+            r"(?:算法题|leetcode题|力扣题)\s*[:：]?\s*(\d{1,4})(?=\s|$|[\.．、\)]|[，。；;,:：!！?？#])",
+            r"(?:lc|leetcode|力扣)\s*[-#]?\s*(\d{1,4})",
+        ]
 
-        for match in re.finditer(r"(?:lc|leetcode|力扣)\s*[-#]?\s*(\d{1,4})", text, flags=re.IGNORECASE):
+        for pattern in explicit_id_patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                try:
+                    value = int(match.group(1))
+                except Exception:
+                    continue
+                if value in self.alg_problem_ids:
+                    hits.add(value)
+
+        for match in re.finditer(r"(?<!\d)(\d{1,4})(?!\s*[\.．]\s*\d)(?=\s|$|[，。；;,:：!！?？#])", text):
             try:
                 value = int(match.group(1))
             except Exception:
@@ -2462,7 +3133,7 @@ class TextMatcher:
         else:
             self.skip_matcher = None
 
-    def _build_allow_override_matcher(self, patterns: list):
+    def _build_allow_override_matcher(self, patterns: list, cache_bucket: str | None = None):
         if not patterns:
             return None
 
@@ -2474,10 +3145,55 @@ class TextMatcher:
         if not single_patterns and len(multi_patterns) == 1:
             return KMPMatcher(multi_patterns[0])
         if not single_patterns and len(multi_patterns) > 1:
+            payload = {
+                "kind": "allow_override_ac",
+                "version": self.automaton_cache_version,
+                "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "patterns": multi_patterns,
+                "transition_strategy": self.char_id_transition_strategy,
+                "char_id_enabled": self.char_id_enabled,
+                "char_id_allow_dynamic": self.char_id_allow_dynamic,
+                "char_id_use_index_field": self.char_id_use_index_field,
+                "dependencies": self._collect_automaton_dependency_snapshots(),
+            }
+            if cache_bucket:
+                return self._build_or_load_cached_automaton(
+                    cache_bucket,
+                    payload,
+                    lambda: ACAhoCorasick(
+                        multi_patterns,
+                        codec=self._create_char_id_codec(),
+                        transition_strategy=self.char_id_transition_strategy,
+                    ),
+                )
             return ACAhoCorasick(
                 multi_patterns,
                 codec=self._create_char_id_codec(),
                 transition_strategy=self.char_id_transition_strategy,
+            )
+
+        payload = {
+            "kind": "allow_override_hybrid",
+            "version": self.automaton_cache_version,
+            "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "single_patterns": single_patterns,
+            "multi_patterns": multi_patterns,
+            "transition_strategy": self.char_id_transition_strategy,
+            "char_id_enabled": self.char_id_enabled,
+            "char_id_allow_dynamic": self.char_id_allow_dynamic,
+            "char_id_use_index_field": self.char_id_use_index_field,
+            "dependencies": self._collect_automaton_dependency_snapshots(),
+        }
+        if cache_bucket:
+            return self._build_or_load_cached_automaton(
+                cache_bucket,
+                payload,
+                lambda: HybridMatcher(
+                    single_patterns,
+                    multi_patterns,
+                    ac_codec=self._create_char_id_codec(),
+                    transition_strategy=self.char_id_transition_strategy,
+                ),
             )
 
         return HybridMatcher(
@@ -2487,7 +3203,7 @@ class TextMatcher:
             transition_strategy=self.char_id_transition_strategy,
         )
 
-    def _try_build_native_matcher(self, multi_patterns: list):
+    def _try_build_native_matcher(self, multi_patterns: list, cache_bucket: str | None = None):
         if self.backend in ("python", "ac-python", "pure-python"):
             return None
 
@@ -2498,6 +3214,19 @@ class TextMatcher:
             return None
 
         try:
+            payload = {
+                "kind": "pyahocorasick",
+                "version": self.automaton_cache_version,
+                "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "patterns": multi_patterns,
+                "backend": self.backend,
+            }
+            if cache_bucket:
+                return self._build_or_load_cached_automaton(
+                    cache_bucket,
+                    payload,
+                    lambda: PyAhoCorasickMatcher(multi_patterns),
+                )
             return PyAhoCorasickMatcher(multi_patterns)
         except Exception as e:
             logging.warning(f"AC 原生后端不可用，已回退 Python 实现: {e}")
@@ -2580,6 +3309,219 @@ class TextMatcher:
 
         return normalized
 
+    def _prepare_content_for_scoring(self, content: str) -> str:
+        raw = str(content or "")
+        if not raw:
+            return ""
+
+        cleaned = self._HTML_BREAK_TAG_RE.sub("\n", raw)
+        cleaned = self._HTML_TAG_RE.sub(" ", cleaned)
+        cleaned = html.unescape(cleaned)
+        cleaned = self._URL_RE.sub(" ", cleaned)
+        return cleaned
+
+    def _extract_numbered_question_items(self, content: str) -> list:
+        text = str(content or "")
+        if not text:
+            return []
+
+        items = []
+        seen_indices = set()
+        last_index = 0
+
+        for raw_line in re.split(r"[\r\n]+", text):
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+
+            match = self._NUMBERED_ITEM_LINE_RE.match(line)
+            if not match:
+                continue
+
+            try:
+                index = int(match.group(1))
+            except Exception:
+                continue
+
+            body = re.sub(r"\s+", " ", str(match.group(2) or "")).strip(" -:：;；,.，。")
+            body_chars = len(re.sub(r"\s+", "", body))
+            if body_chars < self.score_structure_line_min_chars:
+                continue
+
+            if index in seen_indices:
+                continue
+            if last_index > 0 and index <= last_index:
+                continue
+
+            seen_indices.add(index)
+            last_index = index
+            items.append(
+                {
+                    "index": index,
+                    "text": body,
+                }
+            )
+
+        return items
+
+    def _score_structured_question_items(self, items: list, content_chars: int) -> dict:
+        point_count = len(items or [])
+        target_points = max(self.score_structure_target_points, 1)
+        ratio = min(point_count / float(target_points), 1.0)
+
+        structure_score_raw = int(round(self.score_structure_max_score * ratio))
+
+        missing_penalty = 0
+        if point_count < self.score_structure_min_points:
+            missing_penalty = self.score_structure_missing_penalty
+
+        noise_penalty = 0
+        if point_count < self.score_structure_min_points and content_chars > self.score_structure_noise_chars_threshold:
+            overflow = content_chars - self.score_structure_noise_chars_threshold
+            penalty_steps = int(math.ceil(overflow / float(self.score_structure_noise_penalty_step_chars)))
+            noise_penalty = penalty_steps * self.score_structure_noise_penalty_per_step
+            noise_penalty = min(noise_penalty, self.score_structure_noise_penalty_cap)
+
+        score = max(structure_score_raw - missing_penalty - noise_penalty, 0)
+        return {
+            "score": int(score),
+            "raw_score": int(structure_score_raw),
+            "ratio": round(ratio, 4),
+            "point_count": point_count,
+            "missing_penalty": int(missing_penalty),
+            "noise_penalty": int(noise_penalty),
+            "items": [f"{item.get('index', '')}. {item.get('text', '')}" for item in items],
+        }
+
+    def _detect_promotional_content(self, normalized_title: str, normalized_content: str) -> dict:
+        if not self.score_promo_block_enabled or not self.score_promo_block_words:
+            return {
+                "blocked": False,
+                "hits": [],
+                "penalty": 0,
+            }
+
+        merged = "\n".join([token for token in (normalized_title, normalized_content) if token])
+        if not merged:
+            return {
+                "blocked": False,
+                "hits": [],
+                "penalty": 0,
+            }
+
+        hits = []
+        for word in self.score_promo_block_words:
+            if word and word in merged:
+                hits.append(word)
+
+        dedup_hits = sorted(set(hits))
+        blocked = len(dedup_hits) >= self.score_promo_block_min_hits
+
+        return {
+            "blocked": blocked,
+            "hits": dedup_hits,
+            "penalty": int(self.score_promo_block_penalty if blocked else 0),
+        }
+
+    def _detect_numbered_ad_content(self, prepared_content: str, numbered_items: list) -> dict:
+        result = {
+            "blocked": False,
+            "penalty": 0,
+            "segments": 0,
+            "suspicious_segments": 0,
+            "suspicious_ratio": 0.0,
+            "follow_chars": 0,
+            "follow_lines": 0,
+            "marker_hits": [],
+        }
+
+        if not self.score_numbered_ad_block_enabled:
+            return result
+
+        text = str(prepared_content or "")
+        if not text:
+            return result
+
+        lines = [str(line or "").strip() for line in re.split(r"[\r\n]+", text) if str(line or "").strip()]
+        if not lines:
+            return result
+
+        numbered_positions = []
+        for idx, line in enumerate(lines):
+            if self._NUMBERED_ITEM_LINE_RE.match(line):
+                numbered_positions.append(idx)
+
+        if len(numbered_positions) < self.score_numbered_ad_block_min_items:
+            result["segments"] = len(numbered_positions)
+            return result
+
+        suspicious_segments = 0
+        total_follow_chars = 0
+        total_follow_lines = 0
+        marker_hits = []
+
+        for seg_idx, line_idx in enumerate(numbered_positions):
+            next_line_idx = numbered_positions[seg_idx + 1] if seg_idx + 1 < len(numbered_positions) else len(lines)
+            follow_lines = [lines[i] for i in range(line_idx + 1, next_line_idx) if lines[i]]
+            if not follow_lines:
+                continue
+
+            follow_text = "\n".join(follow_lines)
+            follow_chars = len(re.sub(r"\s+", "", follow_text))
+            follow_line_count = len(follow_lines)
+
+            total_follow_chars += follow_chars
+            total_follow_lines += follow_line_count
+
+            normalized_follow = self._normalize_text(follow_text)
+            local_marker_hits = []
+            for marker in self.score_numbered_ad_markers:
+                if marker and marker in normalized_follow:
+                    local_marker_hits.append(marker)
+                    marker_hits.append(marker)
+
+            long_follow_segment = (
+                follow_chars >= self.score_numbered_ad_follow_chars_threshold
+                and follow_line_count >= self.score_numbered_ad_follow_lines_threshold
+            )
+            marker_enhanced_segment = bool(local_marker_hits) and follow_chars >= max(
+                int(self.score_numbered_ad_follow_chars_threshold * 0.25),
+                30,
+            )
+            if long_follow_segment or marker_enhanced_segment:
+                suspicious_segments += 1
+
+        segment_count = len(numbered_positions)
+        suspicious_ratio = suspicious_segments / float(max(segment_count, 1))
+        marker_hit_count = len(set(marker_hits))
+
+        ratio_based_block = (
+            segment_count >= self.score_numbered_ad_block_min_items
+            and suspicious_segments >= self.score_numbered_ad_block_min_items
+            and suspicious_ratio >= self.score_numbered_ad_block_ratio
+        )
+        marker_based_block = (
+            segment_count >= self.score_numbered_ad_block_min_items
+            and suspicious_segments >= 1
+            and marker_hit_count >= self.score_numbered_ad_marker_block_hits
+        )
+        blocked = ratio_based_block or marker_based_block
+
+        result.update(
+            {
+                "blocked": bool(blocked),
+                "penalty": int(self.score_numbered_ad_penalty if blocked else 0),
+                "segments": int(segment_count),
+                "suspicious_segments": int(suspicious_segments),
+                "suspicious_ratio": round(suspicious_ratio, 4),
+                "follow_chars": int(total_follow_chars),
+                "follow_lines": int(total_follow_lines),
+                "marker_hit_count": int(marker_hit_count),
+                "marker_hits": sorted(set(marker_hits)),
+            }
+        )
+        return result
+
     def _search_any_with_optional_skip(self, text: str) -> bool:
         if self.matcher and self.matcher.search_any(text):
             return True
@@ -2636,7 +3578,9 @@ class TextMatcher:
             }
 
         normalized_title = self._normalize_text(title)
-        normalized_content = self._normalize_text(content)
+        prepared_content = self._prepare_content_for_scoring(content)
+        normalized_content = self._normalize_text(prepared_content)
+        normalized_raw_content = self._normalize_text(content)
 
         title_matched = self._search_with_optional_skip(normalized_title)
         content_matched = self._search_with_optional_skip(normalized_content)
@@ -2686,20 +3630,31 @@ class TextMatcher:
                 if weighted_score >= self.score_weighted_keyword_cap:
                     break
 
-        alg_signal = self._evaluate_algorithm_signal(title, content, normalized_title, normalized_content)
+        alg_signal = self._evaluate_algorithm_signal(title, prepared_content, normalized_title, normalized_content)
         alg_score = int(alg_signal.get("score", 0))
 
+        raw_content_chars = len(re.sub(r"\s+", "", normalized_raw_content))
         content_chars = len(re.sub(r"\s+", "", normalized_content))
         if content_chars <= 0:
-            length_ratio = 0.0
+            legacy_length_ratio = 0.0
         else:
-            length_ratio = min(content_chars / float(self.score_length_ideal_chars), 1.0)
+            legacy_length_ratio = min(content_chars / float(self.score_length_ideal_chars), 1.0)
             if content_chars < self.score_length_min_chars:
-                length_ratio *= 0.35
+                legacy_length_ratio *= 0.35
             elif content_chars < self.score_short_content_chars:
-                length_ratio *= 0.75
-        length_ratio = min(max(length_ratio, 0.0), 1.0)
-        length_score = int(round(self.score_length_weight * length_ratio))
+                legacy_length_ratio *= 0.75
+        legacy_length_ratio = min(max(legacy_length_ratio, 0.0), 1.0)
+        legacy_length_score = int(round(self.score_length_weight * legacy_length_ratio))
+
+        structured_items = self._extract_numbered_question_items(prepared_content)
+        structure_eval = self._score_structured_question_items(structured_items, content_chars)
+
+        if self.score_structure_enabled:
+            length_ratio = float(structure_eval.get("ratio", 0.0) or 0.0)
+            length_score = int(structure_eval.get("score", 0) or 0)
+        else:
+            length_ratio = legacy_length_ratio
+            length_score = legacy_length_score
 
         short_penalty = 0
         if 0 < content_chars < self.score_short_content_chars:
@@ -2742,13 +3697,24 @@ class TextMatcher:
 
         effective_match_ratio = max(raw_match_ratio * (1.0 - tail_penalty_ratio) - short_ratio_penalty, 0.0)
         effective_match_ratio = min(effective_match_ratio, 1.0)
-        match_score = int(round(self.score_match_weight * effective_match_ratio))
+        match_score_cap = self.score_match_max_score if self.score_structure_enabled else self.score_match_weight
+        match_score = int(round(match_score_cap * effective_match_ratio))
 
-        final_score = max(min(int(length_score + match_score), 100), 0)
+        promo_signal = self._detect_promotional_content(normalized_title, normalized_content)
+        promo_penalty = int(promo_signal.get("penalty", 0) or 0)
 
-        passed = final_score >= self.score_threshold
+        numbered_ad_signal = self._detect_numbered_ad_content(prepared_content, structured_items)
+        numbered_ad_penalty = int(numbered_ad_signal.get("penalty", 0) or 0)
+
+        final_score = max(min(int(length_score + match_score - promo_penalty - numbered_ad_penalty), 100), 0)
+
+        passed = (
+            final_score >= self.score_threshold
+            and (not bool(promo_signal.get("blocked", False)))
+            and (not bool(numbered_ad_signal.get("blocked", False)))
+        )
         breakdown = {
-            "score_model": "length70_match30",
+            "score_model": "structure_match",
             "length_weight": self.score_length_weight,
             "match_weight": self.score_match_weight,
             "title_score": title_score,
@@ -2763,8 +3729,10 @@ class TextMatcher:
             "alg_hot_title_score": alg_signal.get("hot_title_score", 0),
             "alg_hot_id_score": alg_signal.get("hot_id_score", 0),
             "length_score": length_score,
+            "legacy_length_score": legacy_length_score,
             "match_score": match_score,
             "length_ratio": round(length_ratio, 4),
+            "legacy_length_ratio": round(legacy_length_ratio, 4),
             "match_ratio": round(effective_match_ratio, 4),
             "raw_match_ratio": round(raw_match_ratio, 4),
             "match_signal_score": match_signal_score,
@@ -2774,7 +3742,32 @@ class TextMatcher:
             "tail_tag_penalty": tail_tag_penalty,
             "tail_drain_penalty": tail_drain_penalty,
             "tail_penalty_ratio": round(tail_penalty_ratio, 4),
+            "structure_enabled": self.score_structure_enabled,
+            "structure_target_points": self.score_structure_target_points,
+            "structure_min_points": self.score_structure_min_points,
+            "structure_max_score": self.score_structure_max_score,
+            "match_max_score": self.score_match_max_score,
+            "active_match_score_cap": match_score_cap,
+            "structured_question_count": structure_eval.get("point_count", 0),
+            "structured_question_ratio": structure_eval.get("ratio", 0),
+            "structured_question_raw_score": structure_eval.get("raw_score", 0),
+            "structured_question_missing_penalty": structure_eval.get("missing_penalty", 0),
+            "structured_question_noise_penalty": structure_eval.get("noise_penalty", 0),
+            "structured_questions": structure_eval.get("items", []),
+            "promo_blocked": bool(promo_signal.get("blocked", False)),
+            "promo_hits": promo_signal.get("hits", []),
+            "promo_penalty": promo_penalty,
+            "numbered_ad_blocked": bool(numbered_ad_signal.get("blocked", False)),
+            "numbered_ad_penalty": numbered_ad_penalty,
+            "numbered_ad_segments": numbered_ad_signal.get("segments", 0),
+            "numbered_ad_suspicious_segments": numbered_ad_signal.get("suspicious_segments", 0),
+            "numbered_ad_suspicious_ratio": numbered_ad_signal.get("suspicious_ratio", 0),
+            "numbered_ad_follow_chars": numbered_ad_signal.get("follow_chars", 0),
+            "numbered_ad_follow_lines": numbered_ad_signal.get("follow_lines", 0),
+            "numbered_ad_marker_hit_count": numbered_ad_signal.get("marker_hit_count", 0),
+            "numbered_ad_marker_hits": numbered_ad_signal.get("marker_hits", []),
             "content_chars": content_chars,
+            "raw_content_chars": raw_content_chars,
             "title_matches": sorted(title_matched),
             "content_matches": sorted(content_matched),
             "weighted_hits": weighted_hits,
@@ -2791,7 +3784,7 @@ class TextMatcher:
 
         if self.score_debug_log and logging.getLogger().isEnabledFor(logging.INFO):
             logging.info(
-                f"[{self.algo_name}] 质量评分: {final_score}/{self.score_threshold} | 长度分={length_score} 匹配分={match_score} | 长度比={length_ratio:.2f} 匹配比={effective_match_ratio:.2f} | 字数={content_chars}"
+                f"[{self.algo_name}] 质量评分: {final_score}/{self.score_threshold} | 结构分={length_score} 匹配分={match_score} | 分点={structure_eval.get('point_count', 0)} | 结构比={length_ratio:.2f} 匹配比={effective_match_ratio:.2f} | 卖课拦截={promo_signal.get('blocked', False)} | 编号广告拦截={numbered_ad_signal.get('blocked', False)} | 字数={content_chars}"
             )
 
         return {

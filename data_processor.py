@@ -23,7 +23,8 @@ class DataProcessor:
         "面经", "慎投", "保姆级", "教学", "双非", "纯八股", "八股", "不感兴趣",
         "三月", "四月", "事业部", "合集", "攻略", "经验贴", "问答",
         "大厂", "小厂", "怒砍", "这些公司", "总结....",
-        "没有公司", "无公司", "公司名", "公司名称"
+        "没有公司", "无公司", "公司名", "公司名称",
+        "转码", "非科班", "科班"
     }
 
     COMPANY_ALIAS_MAP = {
@@ -140,15 +141,47 @@ class DataProcessor:
         )
         self.company_debug_log = bool(self.config.get("company_debug_log", False))
         self.show_progress_bar = bool(self.config.get("show_progress_bar", True))
+        self.export_progress_log = bool(self.config.get("export_progress_log", True))
         self.include_id_column = bool(self.config.get("include_id_column", False))
         self.include_algorithm_annotations = bool(self.config.get("include_algorithm_annotations", True))
+        self.include_question_outline = bool(self.config.get("include_question_outline", False))
+        self.fetch_comments_enabled = bool(self.config.get("fetch_comments_enabled", False))
+        self.include_comments_column = bool(self.config.get("include_comments_column", self.fetch_comments_enabled))
+        self.company_must_in_list = bool(self.config.get("company_must_in_list", True))
         self.drop_unknown_company_posts = bool(self.config.get("drop_unknown_company_posts", True))
         self.require_company_in_title = bool(self.config.get("require_company_in_title", True))
         self.company_owner_inference_enabled = bool(self.config.get("company_owner_inference_enabled", True))
         self.company_owner_query_timeout = float(self.config.get("company_owner_query_timeout", 6) or 6)
         self.company_owner_max_suggestions = max(int(self.config.get("company_owner_max_suggestions", 12) or 12), 5)
-        self.filtered_posts_log = bool(self.config.get("filtered_posts_log", False))
-        self.filtered_posts_log_limit = int(self.config.get("filtered_posts_log_limit", 50) or 50)
+        self.company_cache_mode = str(self.config.get("company_cache_mode", "online") or "online").strip().lower()
+        if self.company_cache_mode not in {"online", "reuse_then_refresh"}:
+            self.company_cache_mode = "online"
+        self.company_runtime_cache_enabled = bool(self.config.get("company_runtime_cache_enabled", True))
+        runtime_cache_path = str(
+            self.config.get("company_runtime_cache_path", "ENV/.cache/company_resolver_cache.json")
+            or "ENV/.cache/company_resolver_cache.json"
+        ).strip()
+        if runtime_cache_path and not os.path.isabs(runtime_cache_path):
+            runtime_cache_path = os.path.join(os.getcwd(), runtime_cache_path)
+        self.company_runtime_cache_path = runtime_cache_path
+        self.company_cache_refresh_after_run = bool(self.config.get("company_cache_refresh_after_run", True))
+        self.company_cache_refresh_max_tokens = max(
+            int(self.config.get("company_cache_refresh_max_tokens", 80) or 80),
+            0,
+        )
+        self.company_runtime_cache_max_entries = max(
+            int(self.config.get("company_runtime_cache_max_entries", 20000) or 20000),
+            500,
+        )
+        legacy_filtered_posts_log = bool(self.config.get("filtered_posts_log", False))
+        legacy_filtered_posts_log_limit = int(self.config.get("filtered_posts_log_limit", 50) or 50)
+        self.unknown_company_filtered_posts_log = bool(
+            self.config.get("unknown_company_filtered_posts_log", legacy_filtered_posts_log)
+        )
+        self.unknown_company_filtered_posts_log_limit = int(
+            self.config.get("unknown_company_filtered_posts_log_limit", legacy_filtered_posts_log_limit)
+            or legacy_filtered_posts_log_limit
+        )
         self.max_items_per_keyword = int(self.config.get("max_items_per_keyword", 0) or 0)
         self.dropped_unknown_company_count = 0
         self.dropped_unknown_company_examples = []
@@ -160,6 +193,167 @@ class DataProcessor:
         self.company_cache = {}
         self.owner_company_cache = {}
         self.baidu_suggestion_cache = {}
+        self._runtime_cache_dirty = False
+        self._pending_company_verify_tokens = set()
+        self._pending_owner_infer_tokens = set()
+        self._load_runtime_cache()
+
+    def _mark_runtime_cache_dirty(self):
+        if self.company_runtime_cache_enabled:
+            self._runtime_cache_dirty = True
+
+    def _cache_put(self, bucket: Dict, key: str, value):
+        if bucket.get(key) != value:
+            bucket[key] = value
+            self._mark_runtime_cache_dirty()
+
+    def _truncate_cache_mapping(self, mapping: Dict, limit: int):
+        if not isinstance(mapping, dict) or limit <= 0 or len(mapping) <= limit:
+            return
+        retained = list(mapping.items())[-limit:]
+        mapping.clear()
+        mapping.update(retained)
+
+    def _load_runtime_cache(self):
+        if not self.company_runtime_cache_enabled or not self.company_runtime_cache_path:
+            return
+        if not os.path.exists(self.company_runtime_cache_path):
+            return
+
+        try:
+            with open(self.company_runtime_cache_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            self._company_log(f"[Cache] 读取公司缓存失败，将忽略旧缓存: {e}")
+            return
+
+        if not isinstance(payload, dict):
+            return
+
+        raw_company_cache = payload.get("company_cache", {})
+        if isinstance(raw_company_cache, dict):
+            for raw_key, raw_value in raw_company_cache.items():
+                key = str(raw_key or "").strip()
+                if not key:
+                    continue
+                self.company_cache[key] = bool(raw_value)
+
+        raw_owner_cache = payload.get("owner_company_cache", {})
+        if isinstance(raw_owner_cache, dict):
+            for raw_key, raw_value in raw_owner_cache.items():
+                key = str(raw_key or "").strip()
+                if not key:
+                    continue
+                value = str(raw_value or "").strip()
+                self.owner_company_cache[key] = value
+
+        raw_baidu_cache = payload.get("baidu_suggestion_cache", {})
+        if isinstance(raw_baidu_cache, dict):
+            for raw_key, raw_value in raw_baidu_cache.items():
+                key = str(raw_key or "").strip()
+                if not key:
+                    continue
+
+                suggestions = []
+                if isinstance(raw_value, list):
+                    for item in raw_value[:20]:
+                        token = str(item or "").strip()
+                        if token:
+                            suggestions.append(token)
+                self.baidu_suggestion_cache[key] = suggestions
+
+        self._truncate_cache_mapping(self.company_cache, self.company_runtime_cache_max_entries)
+        self._truncate_cache_mapping(self.owner_company_cache, self.company_runtime_cache_max_entries)
+        self._truncate_cache_mapping(self.baidu_suggestion_cache, self.company_runtime_cache_max_entries)
+
+        self._runtime_cache_dirty = False
+        self._company_log(
+            "[Cache] 公司缓存加载完成: "
+            f"company={len(self.company_cache)} owner={len(self.owner_company_cache)} sugg={len(self.baidu_suggestion_cache)}"
+        )
+
+    def _save_runtime_cache(self):
+        if not self.company_runtime_cache_enabled or not self.company_runtime_cache_path:
+            return
+        if not self._runtime_cache_dirty:
+            return
+
+        self._truncate_cache_mapping(self.company_cache, self.company_runtime_cache_max_entries)
+        self._truncate_cache_mapping(self.owner_company_cache, self.company_runtime_cache_max_entries)
+        self._truncate_cache_mapping(self.baidu_suggestion_cache, self.company_runtime_cache_max_entries)
+
+        payload = {
+            "version": "v1",
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "company_cache": self.company_cache,
+            "owner_company_cache": self.owner_company_cache,
+            "baidu_suggestion_cache": self.baidu_suggestion_cache,
+        }
+
+        try:
+            dir_path = os.path.dirname(self.company_runtime_cache_path)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+            with open(self.company_runtime_cache_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            self._runtime_cache_dirty = False
+            self._company_log(
+                "[Cache] 公司缓存已写入: "
+                f"{self.company_runtime_cache_path} "
+                f"(company={len(self.company_cache)}, owner={len(self.owner_company_cache)}, sugg={len(self.baidu_suggestion_cache)})"
+            )
+        except Exception as e:
+            self._company_log(f"[Cache] 写入公司缓存失败: {e}")
+
+    def _refresh_runtime_cache_after_run(self):
+        if not self.company_runtime_cache_enabled:
+            return
+        if self.company_cache_mode != "reuse_then_refresh":
+            return
+        if not self.company_cache_refresh_after_run:
+            return
+
+        pending_tokens = []
+        pending_seen = set()
+        for token in list(self._pending_company_verify_tokens) + list(self._pending_owner_infer_tokens):
+            key = str(token or "").strip()
+            if not key or key in pending_seen:
+                continue
+            pending_seen.add(key)
+            pending_tokens.append(key)
+
+        if not pending_tokens:
+            return
+
+        if self.company_cache_refresh_max_tokens > 0:
+            pending_tokens = pending_tokens[:self.company_cache_refresh_max_tokens]
+        if not pending_tokens:
+            return
+
+        start = time.perf_counter()
+        refreshed_count = 0
+        owner_infer_hits = 0
+
+        self._company_log(f"[Cache] 末尾增量刷新开始，待刷新词数: {len(pending_tokens)}")
+        for token in pending_tokens:
+            refreshed_count += 1
+            is_company = self._verify_company_online(token, force_online=True)
+            if is_company:
+                if token not in self.companies:
+                    self.companies.add(token)
+                    self._save_new_company_to_config(token)
+                continue
+
+            inferred_owner = self._infer_owner_company_online(token, force_online=True)
+            if inferred_owner:
+                owner_infer_hits += 1
+
+        elapsed = time.perf_counter() - start
+        self._pending_company_verify_tokens.clear()
+        self._pending_owner_infer_tokens.clear()
+        self._company_log(
+            f"[Cache] 末尾增量刷新完成: 刷新={refreshed_count}, 归属命中={owner_infer_hits}, 耗时={elapsed:.2f}s"
+        )
 
     def _load_companies(self) -> set:
         companies = set()
@@ -469,8 +663,14 @@ class DataProcessor:
         except Exception as e:
             self._company_log(f"[Debug] 请求建议词失败: {e}")
 
-        self.baidu_suggestion_cache[token] = suggestions
-        return suggestions
+        normalized = []
+        for item in suggestions[:20]:
+            suggestion = str(item or "").strip()
+            if suggestion:
+                normalized.append(suggestion)
+
+        self._cache_put(self.baidu_suggestion_cache, token, normalized)
+        return normalized
 
     def _infer_owner_company_from_suggestions(self, word: str, suggestions: List[str]) -> str:
         if not suggestions:
@@ -513,7 +713,7 @@ class DataProcessor:
 
         return best_company
 
-    def _infer_owner_company_online(self, word: str) -> str:
+    def _infer_owner_company_online(self, word: str, force_online: bool = False) -> str:
         if not self.company_owner_inference_enabled:
             return ""
 
@@ -527,8 +727,12 @@ class DataProcessor:
         for alias, company in self.owner_alias_to_company.items():
             if self._title_contains_token(token, alias):
                 resolved = self._normalize_company_name(company)
-                self.owner_company_cache[token] = resolved
+                self._cache_put(self.owner_company_cache, token, resolved)
                 return resolved
+
+        if self.company_cache_mode == "reuse_then_refresh" and (not force_online):
+            self._pending_owner_infer_tokens.add(token)
+            return ""
 
         suggestions = self._query_baidu_suggestions(token)
         inferred = self._infer_owner_company_from_suggestions(token, suggestions)
@@ -538,10 +742,10 @@ class DataProcessor:
             owner_suggestions = self._query_baidu_suggestions(owner_query)
             inferred = self._infer_owner_company_from_suggestions(token, owner_suggestions)
 
-        self.owner_company_cache[token] = inferred or ""
+        self._cache_put(self.owner_company_cache, token, inferred or "")
         return inferred or ""
 
-    def _verify_company_online(self, word: str) -> bool:
+    def _verify_company_online(self, word: str, force_online: bool = False) -> bool:
         word = (word or "").strip()
         if len(word) < 2 or len(word) > 20:
             return False
@@ -551,6 +755,10 @@ class DataProcessor:
             return False
         if word in self.company_cache:
             return self.company_cache[word]
+
+        if self.company_cache_mode == "reuse_then_refresh" and (not force_online):
+            self._pending_company_verify_tokens.add(word)
+            return False
 
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -570,7 +778,7 @@ class DataProcessor:
                 if not shell_page:
                     page_hit = word in text and any(k in text for k in ("公司", "企业", "有限公司", "股份", "集团"))
                     if page_hit:
-                        self.company_cache[word] = True
+                        self._cache_put(self.company_cache, word, True)
                         self._company_log(f"[-] 动态检测到新公司(爱企查直链): '{word}'")
                         return True
                 else:
@@ -581,12 +789,12 @@ class DataProcessor:
         suggestions = self._query_baidu_suggestions(word)
         if suggestions:
             is_company = self._is_company_by_suggestions(word, suggestions)
-            self.company_cache[word] = is_company
+            self._cache_put(self.company_cache, word, is_company)
             if is_company:
                 self._company_log(f"[-] 动态检测到新公司(建议词): '{word}'")
             return is_company
 
-        self.company_cache[word] = False
+        self._cache_put(self.company_cache, word, False)
         return False
 
     def _extract_company(self, title: str, content: str):
@@ -601,6 +809,9 @@ class DataProcessor:
             company_name = self._normalize_company_name((company_name or "").strip())
             matched_token = (matched_token or "").strip()
             if not company_name or not matched_token:
+                return
+
+            if self.company_must_in_list and company_name not in self.companies:
                 return
 
             score = self._score_title_candidate(title, matched_token, source)
@@ -688,6 +899,15 @@ class DataProcessor:
                     add_candidate(normalized, p_clean, "alias_map")
                     continue
 
+                if self.company_must_in_list:
+                    if normalized in self.companies:
+                        add_candidate(normalized, p_clean, "known_company")
+                    else:
+                        self._company_log(
+                            f"[Debug] 严格白名单模式，跳过非 companies 公司词: '{p_clean}'"
+                        )
+                    continue
+
                 self._company_log(f"[Debug] 开始在线校验可能的新公司: '{p_clean}' (来自标题: '{title}')")
                 if self._verify_company_online(p_clean):
                     if p_clean not in self.companies:
@@ -710,6 +930,12 @@ class DataProcessor:
             candidates.items(),
             key=lambda item: (item[1]["score"], len(item[1]["token"]), -item[1]["position"])
         )
+
+        if self.company_must_in_list and best_company not in self.companies:
+            self._company_log(
+                f"[Debug] 严格白名单模式，最终候选 '{best_company}' 不在 companies 中，回退为其他"
+            )
+            return "其他"
 
         self._company_log(f"[DataProcessor] 提取到的公司名称为: '{best_company}'")
         return best_company
@@ -768,12 +994,34 @@ class DataProcessor:
         return "\n".join(lines)
 
     def _build_expected_columns(self) -> List[str]:
-        columns = ["标题", "公司", "搜索关键词", "帖子链接", "正文", "评论及回复"]
+        columns = ["标题", "公司", "搜索关键词", "帖子链接", "正文"]
+        if self.include_comments_column:
+            columns.append("评论及回复")
+        if self.include_question_outline:
+            columns.append("面试题清单")
         if self.include_algorithm_annotations:
             columns.append("算法标注")
         if self.include_id_column:
             columns = ["ID"] + columns
         return columns
+
+    def _format_question_outline(self, items) -> str:
+        if not isinstance(items, list) or not items:
+            return ""
+
+        normalized_lines = []
+        seen = set()
+        for item in items[:30]:
+            line = str(item or "").strip()
+            if not line:
+                continue
+            line = re.sub(r"\s+", " ", line)
+            if line in seen:
+                continue
+            seen.add(line)
+            normalized_lines.append(line)
+
+        return "\n".join(normalized_lines)
 
     def _sanitize_html_text(self, text: str) -> str:
         cleaned = re.sub(r"<br\s*/?>|</p>|</div>", "\n", str(text or ""), flags=re.IGNORECASE)
@@ -788,8 +1036,13 @@ class DataProcessor:
             "搜索关键词": keyword,
             "帖子链接": item.get("url", ""),
             "正文": content,
-            "评论及回复": comments,
         }
+
+        if self.include_comments_column:
+            record["评论及回复"] = comments
+
+        if self.include_question_outline:
+            record["面试题清单"] = self._format_question_outline(item.get("question_outline", []))
 
         if self.include_algorithm_annotations:
             record["算法标注"] = self._format_algorithm_annotations(item.get("algorithm_matches", []))
@@ -802,6 +1055,10 @@ class DataProcessor:
     def _render_clean_progress(self, current: int, total: int):
         if self.show_progress_bar and not self.company_debug_log:
             self._render_progress(current, total, "清洗打标进度")
+
+    def _render_export_progress(self, current: int, total: int, prefix: str):
+        if self.show_progress_bar and self.export_progress_log and not self.company_debug_log:
+            self._render_progress(current, total, prefix)
 
     def _record_dropped_unknown_company(self, keyword: str, title: str, url: str):
         unknown_example = {
@@ -819,40 +1076,46 @@ class DataProcessor:
         kept_keyword_counter = {}
         expected_columns = self._build_expected_columns()
 
-        total_items = len(self.data)
-        for idx, item in enumerate(self.data, start=1):
-            keyword = item.get("keyword", "")
+        try:
+            total_items = len(self.data)
+            for idx, item in enumerate(self.data, start=1):
+                keyword = item.get("keyword", "")
 
-            if self.max_items_per_keyword > 0 and keyword:
-                if kept_keyword_counter.get(keyword, 0) >= self.max_items_per_keyword:
+                if self.max_items_per_keyword > 0 and keyword:
+                    if kept_keyword_counter.get(keyword, 0) >= self.max_items_per_keyword:
+                        self._render_clean_progress(idx, total_items)
+                        continue
+
+                title = item.get("title", "")
+                content = self._sanitize_html_text(item.get("content", ""))
+                comments = ""
+                if self.include_comments_column:
+                    comments = self._sanitize_html_text("\n".join(item.get("comments", [])))
+
+                company = self._extract_company(title, content)
+                record = self._build_clean_record(item, title, company, keyword, content, comments)
+
+                should_drop_unknown = self.drop_unknown_company_posts or self.require_company_in_title
+                if should_drop_unknown and company == "其他":
+                    self._record_dropped_unknown_company(
+                        keyword=keyword,
+                        title=title,
+                        url=item.get("url", ""),
+                    )
                     self._render_clean_progress(idx, total_items)
                     continue
 
-            title = item.get("title", "")
-            content = self._sanitize_html_text(item.get("content", ""))
-            comments = self._sanitize_html_text("\n".join(item.get("comments", [])))
+                cleaned_data.append(record)
+                if keyword:
+                    kept_keyword_counter[keyword] = kept_keyword_counter.get(keyword, 0) + 1
 
-            company = self._extract_company(title, content)
-            record = self._build_clean_record(item, title, company, keyword, content, comments)
-
-            should_drop_unknown = self.drop_unknown_company_posts or self.require_company_in_title
-            if should_drop_unknown and company == "其他":
-                self._record_dropped_unknown_company(
-                    keyword=keyword,
-                    title=title,
-                    url=item.get("url", ""),
-                )
                 self._render_clean_progress(idx, total_items)
-                continue
 
-            cleaned_data.append(record)
-            if keyword:
-                kept_keyword_counter[keyword] = kept_keyword_counter.get(keyword, 0) + 1
-
-            self._render_clean_progress(idx, total_items)
-
-        df = pd.DataFrame(cleaned_data, columns=expected_columns)
-        return df
+            df = pd.DataFrame(cleaned_data, columns=expected_columns)
+            return df
+        finally:
+            self._refresh_runtime_cache_after_run()
+            self._save_runtime_cache()
 
     def _sanitize_markdown_text(self, text: str) -> str:
         if text is None:
@@ -879,6 +1142,38 @@ class DataProcessor:
         result = re.sub(r'\n{3,}', '\n\n', result).strip()
         return result
 
+    def _sanitize_outline_text(self, text: str) -> str:
+        if text is None:
+            return ""
+
+        lines = str(text).splitlines()
+        cleaned_lines = []
+        for line in lines:
+            current = line.rstrip().replace("\t", "    ")
+            current = re.sub(r'^\s{0,3}#{1,6}\s*', '', current)
+            current = current.replace("```", "'''")
+            if current.strip():
+                cleaned_lines.append(current)
+
+        result = "\n".join(cleaned_lines)
+        result = re.sub(r'\n{3,}', '\n\n', result).strip()
+        return result
+
+    def _merge_body_with_outline(self, content: str, outline: str) -> str:
+        body = str(content or "").strip()
+        clean_outline = str(outline or "").strip()
+        if not clean_outline:
+            return body
+
+        if not body:
+            return clean_outline
+
+        first_outline_line = clean_outline.splitlines()[0].strip() if clean_outline.splitlines() else ""
+        if first_outline_line and first_outline_line in body:
+            return body
+
+        return f"{clean_outline}\n\n{body}".strip()
+
     def save_to_excel(self, df: pd.DataFrame, filename="nowcoder_data.xlsx"):
         try:
             with pd.ExcelWriter(filename, engine='xlsxwriter') as writer:
@@ -887,7 +1182,9 @@ class DataProcessor:
                 worksheet = writer.sheets['面经汇总']
                 
                 wrap_format = workbook.add_format({'text_wrap': True, 'valign': 'top'})
-                title_format = workbook.add_format({'text_wrap': True, 'valign': 'bottom'})
+                top_format = workbook.add_format({'valign': 'top'})
+                title_format = workbook.add_format({'text_wrap': True, 'valign': 'top'})
+                link_format = workbook.add_format({'font_color': 'blue', 'underline': 1, 'valign': 'top'})
                 header_format = workbook.add_format({'bold': True, 'bg_color': '#D7E4BC', 'border': 1, 'valign': 'top'})
                 
                 for col_num, value in enumerate(df.columns.values):
@@ -895,8 +1192,19 @@ class DataProcessor:
 
                 if '标题' in df.columns:
                     title_col_idx = df.columns.get_loc('标题')
+                    total_rows = len(df)
                     for row_num, title_value in enumerate(df['标题'].tolist(), start=1):
                         worksheet.write(row_num, title_col_idx, title_value, title_format)
+                        self._render_export_progress(row_num, total_rows, "Excel写入进度")
+
+                if '帖子链接' in df.columns:
+                    link_col_idx = df.columns.get_loc('帖子链接')
+                    for row_num, link_value in enumerate(df['帖子链接'].tolist(), start=1):
+                        cell_value = "" if pd.isna(link_value) else str(link_value)
+                        if cell_value and re.match(r'^https?://', cell_value, flags=re.IGNORECASE):
+                            worksheet.write_url(row_num, link_col_idx, cell_value, link_format, string=cell_value)
+                        else:
+                            worksheet.write(row_num, link_col_idx, cell_value, top_format)
 
                 from xlsxwriter.utility import xl_col_to_name
 
@@ -908,6 +1216,7 @@ class DataProcessor:
                     '帖子链接': 45,
                     '正文': 80,
                     '评论及回复': 80,
+                    '面试题清单': 80,
                     '算法标注': 90,
                 }
 
@@ -918,10 +1227,10 @@ class DataProcessor:
 
                     if col_name == '标题':
                         worksheet.set_column(col_range, width, title_format)
-                    elif col_name in ('正文', '评论及回复', '算法标注'):
+                    elif col_name in ('正文', '评论及回复', '面试题清单', '算法标注'):
                         worksheet.set_column(col_range, width, wrap_format)
                     else:
-                        worksheet.set_column(col_range, width)
+                        worksheet.set_column(col_range, width, top_format)
 
             print(f"数据已成功排版并存入全局单个文件: '{filename}'")
                 
@@ -939,13 +1248,13 @@ class DataProcessor:
                 f.write("# 牛客网面经汇总\n\n")
                 f.write(f"> 自动抓取时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}，共计 {len(df)} 篇面经。\n\n")
                 f.write("---\n\n")
-                
-                for idx, row in df.iterrows():
+
+                total_rows = len(df)
+                for row_index, (_, row) in enumerate(df.iterrows(), start=1):
                     title = row.get('标题', '无标题')
                     company = row.get('公司', '未分类')
                     url = row.get('帖子链接', '无链接')
                     content = self._sanitize_markdown_text(row.get('正文', '无内容'))
-                    comments = self._sanitize_markdown_text(row.get('评论及回复', ''))
                     algorithm_notes = self._sanitize_markdown_text(row.get('算法标注', ''))
 
                     f.write(f"## {title}\n\n")
@@ -953,10 +1262,9 @@ class DataProcessor:
                     f.write(f"- **链接**: {url}\n\n")
                     f.write(f"### 正文\n\n{content}\n\n")
                     if algorithm_notes and str(algorithm_notes).strip():
-                        f.write(f"### 算法标注\n\n{algorithm_notes}\n\n")
-                    if comments and str(comments).strip():
-                        f.write(f"### 评论摘录\n\n{comments}\n\n")
+                        f.write(f"### 算法题特别标注\n\n{algorithm_notes}\n\n")
                     f.write("---\n\n")
+                    self._render_export_progress(row_index, total_rows, "Markdown写入进度")
                     
             print(f"数据已成功排版并存入 Markdown 文件: '{filename}'")
             
@@ -970,23 +1278,22 @@ class DataProcessor:
 
         try:
             with open(filename, 'w', encoding='utf-8') as f:
-                for idx, row in df.iterrows():
+                total_rows = len(df)
+                for row_index, (_, row) in enumerate(df.iterrows(), start=1):
                     title = row.get('标题', '无标题')
                     company = row.get('公司', '未分类')
                     url = row.get('帖子链接', '无链接')
                     content = row.get('正文', '无内容')
-                    comments = row.get('评论及回复', '')
                     algorithm_notes = row.get('算法标注', '')
 
                     f.write(f"【标题】 {title}\n")
                     f.write(f"【公司】 {company}\n")
                     f.write(f"【链接】 {url}\n")
-                    f.write(f"【正文】\n{content}\n")
+                    f.write(f"【正文】\n{str(content or '')}\n")
                     if algorithm_notes and str(algorithm_notes).strip():
-                        f.write(f"\n【算法标注】\n{algorithm_notes}\n")
-                    if comments and str(comments).strip():
-                        f.write(f"\n【评论】\n{comments}\n")
+                        f.write(f"\n【算法题特别标注】\n{algorithm_notes}\n")
                     f.write("\n" + "="*80 + "\n\n")
+                    self._render_export_progress(row_index, total_rows, "TXT写入进度")
 
             print(f"数据已成功排版并存入纯文本 TXT 文件: '{filename}'")
 
@@ -1001,8 +1308,8 @@ class DataProcessor:
         if should_drop_unknown and self.dropped_unknown_company_count > 0:
             print(f"已过滤未识别公司帖子: {self.dropped_unknown_company_count} 篇")
 
-            if self.filtered_posts_log:
-                limit = max(self.filtered_posts_log_limit, 0)
+            if self.unknown_company_filtered_posts_log:
+                limit = max(self.unknown_company_filtered_posts_log_limit, 0)
                 examples = self.dropped_unknown_company_examples[:limit] if limit > 0 else self.dropped_unknown_company_examples
                 print(f"\n过滤帖子明细(展示 {len(examples)}/{self.dropped_unknown_company_count}):")
                 for i, item in enumerate(examples, start=1):

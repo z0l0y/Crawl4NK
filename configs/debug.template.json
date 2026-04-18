@@ -1,9 +1,30 @@
 {
     "show_progress_bar":  true,
+    "progress_render_interval_sec":  0.08,
+    "export_progress_log":  true,
+    "stage_spinner_enabled":  false,
+    "stage_spinner_interval_sec":  0.12,
+    "init_profile_log":  false,
     "runtime_summary_log":  false,
+    "timing_profile_log":  false,
+    "timing_profile_keyword_log":  false,
+    "timing_profile_topn":  6,
+    "timing_profile_live_log":  false,
+    "progress_prefer_status":  true,
+    "timing_profile_live_topn":  4,
+    "timing_profile_live_interval_sec":  0.35,
     "keyword_status_log":  false,
+    "search_page_progress_log":  true,
+    "search_page_stop_reason_log":  false,
+    "pipeline_stage_progress_log":  true,
+    "activity_status_enabled":  false,
+    "activity_status_interval_sec":  0.15,
     "crawl_debug_log":  false,
     "company_debug_log":  false,
+    "unknown_company_filtered_posts_log":  false,
+    "unknown_company_filtered_posts_log_limit":  30,
+    "score_filtered_posts_log":  false,
+    "score_filtered_posts_log_limit":  30,
     "filtered_posts_log":  false,
     "filtered_posts_log_limit":  50,
     "debug_log":  false,
@@ -14,6 +35,6 @@
                              "print_full_text_metadata":  false,
                              "text_sample_count":  5,
                              "text_sample_chars":  120,
-                             "print_round_timings":  true
+                             "print_round_timings":  false
                          }
 }
