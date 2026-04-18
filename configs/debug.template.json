@@ -1,5 +1,7 @@
 {
     "show_progress_bar":  true,
+    "runtime_summary_log":  false,
+    "keyword_status_log":  false,
     "crawl_debug_log":  false,
     "company_debug_log":  false,
     "filtered_posts_log":  false,

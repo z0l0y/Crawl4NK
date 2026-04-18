@@ -1,7 +1,7 @@
 import argparse
 import os
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 from config_loader import load_config
 from crawler import NowcoderCrawler
@@ -62,16 +62,21 @@ def print_runtime_summary(config: Dict, loaded_files: List[str], keywords: List[
     filter_rules = config.get("filter_rules", {})
     force_combine = filter_rules.get("force_combine", {})
     score_filter = filter_rules.get("score_filter", {})
+    require_company_in_title = bool(config.get("require_company_in_title", True))
 
     print(f"内容拦截 -> 必须包含 {filter_rules.get('must_contain', [])}，排斥包含 {filter_rules.get('must_not_contain', [])}")
     print(f"白名单覆盖 -> {filter_rules.get('allow_overrides', [])}")
     print(f"跳字符匹配 -> {filter_rules.get('skip_char_match', {}).get('enabled', False)}")
     print(f"标题强规则 -> {force_combine.get('title_force_contains', [])}")
     print(f"正文组合规则 -> {force_combine.get('content_combine_contains', [])}")
+    print(f"标题公司要求 -> {require_company_in_title} (未识别公司将直接丢弃)")
     print(f"模式缓存 -> {filter_rules.get('pattern_cache', {}).get('enabled', False)}")
-    print(f"质量评分过滤 -> {score_filter.get('enabled', False)} (阈值: {score_filter.get('threshold', 90)})")
+    print(f"质量评分过滤 -> {score_filter.get('enabled', False)} (阈值: {score_filter.get('threshold', 62)})")
 
     if score_filter.get("enabled", False):
+        print(
+            f"评分配比 -> 长度 {score_filter.get('length_weight', 70)} / 匹配 {score_filter.get('match_weight', 30)}"
+        )
         print(f"算法词库评分 -> {score_filter.get('alg_enabled', True)} (词库: {score_filter.get('alg_path', '')})")
         print(f"面试高频题加权 -> {score_filter.get('alg_hot_enabled', True)} (总封顶: {score_filter.get('alg_hot_total_cap', 48)})")
 
@@ -90,6 +95,12 @@ def print_filtered_score_details(crawler: NowcoderCrawler, config: Dict):
             f"  [{index}] {item.get('score', 0)}/{item.get('threshold', crawler.score_filter_threshold)} | "
             f"字数={item.get('content_chars', 0)} | 标题: {item.get('title', '')}"
         )
+
+        if item.get("length_score") is not None or item.get("match_score") is not None:
+            print(
+                f"      长度分: {item.get('length_score', 0)} | 匹配分: {item.get('match_score', 0)} "
+                f"(长度比: {item.get('length_ratio', 0)}, 匹配比: {item.get('match_ratio', 0)})"
+            )
 
         if item.get("alg_score", 0):
             print(f"      算法分: {item.get('alg_score', 0)}")
@@ -146,8 +157,10 @@ def main():
     base_output = str(config.get("output_file", "nowcoder_data") or "nowcoder_data")
     output_filename_base = build_output_filename_base(base_output, max_pages, max_items)
     formats = config.get("output_formats", ["xlsx"])
+    runtime_summary_log = bool(config.get("runtime_summary_log", False))
 
-    print_runtime_summary(config, loaded_files, keywords, max_pages, max_items)
+    if runtime_summary_log:
+        print_runtime_summary(config, loaded_files, keywords, max_pages, max_items)
 
     crawler = NowcoderCrawler(config=config)
     raw_data = crawler.crawl()

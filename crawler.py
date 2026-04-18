@@ -29,6 +29,7 @@ class NowcoderCrawler:
         self.ac_native_min_patterns = int(config.get("ac_native_min_patterns", 64) or 64)
         self.crawl_debug_log = bool(config.get("crawl_debug_log", config.get("debug_log", False)))
         self.show_progress_bar = bool(config.get("show_progress_bar", True))
+        self.keyword_status_log = bool(config.get("keyword_status_log", False))
         self.request_connect_timeout = float(config.get("request_connect_timeout", 5) or 5)
         self.request_read_timeout = float(config.get("request_read_timeout", 15) or 15)
         self.request_retry_count = int(config.get("request_retry_count", 2) or 2)
@@ -192,6 +193,10 @@ class NowcoderCrawler:
                 "alg_hot_title_hits": breakdown.get("alg_hot_title_hits", []),
                 "alg_hot_id_hits": breakdown.get("alg_hot_id_hits", []),
                 "alg_hot_matches": breakdown.get("alg_hot_matches", []),
+                "length_score": breakdown.get("length_score", 0),
+                "match_score": breakdown.get("match_score", 0),
+                "length_ratio": breakdown.get("length_ratio", 0),
+                "match_ratio": breakdown.get("match_ratio", 0),
                 "tail_tags": breakdown.get("tail_tags", []),
             }
         )
@@ -535,7 +540,7 @@ class NowcoderCrawler:
                         if self.crawl_debug_log:
                             logging.warning(f"[-] drop post with empty content: {p['title']} [{p['id']}]")
 
-                    if self.show_progress_bar and not self.crawl_debug_log:
+                    if self.keyword_status_log and self.show_progress_bar and not self.crawl_debug_log:
                         self._render_keyword_status(kw, handled_candidates, archived_for_keyword)
 
                 if not reached_quota:

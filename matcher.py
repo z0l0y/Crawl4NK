@@ -1387,13 +1387,21 @@ class TextMatcher:
         cfg = score_filter if isinstance(score_filter, dict) else {}
 
         self.score_enabled = bool(cfg.get("enabled", False))
-        self.score_threshold = max(int(cfg.get("threshold", 90) or 90), 0)
+        self.score_threshold = max(int(cfg.get("threshold", 62) or 62), 0)
         self.score_debug_log = bool(cfg.get("debug_log", False))
         cpu_count = max(int(os.cpu_count() or 4), 1)
         self.score_parallel_enabled = bool(cfg.get("parallel_enabled", True))
         self.score_parallel_workers = max(int(cfg.get("parallel_workers", min(max(cpu_count // 2, 2), 8)) or 1), 1)
         self.score_parallel_batch_size = max(int(cfg.get("parallel_batch_size", 8) or 8), 1)
         self.score_async_build = bool(cfg.get("async_build", True))
+
+        raw_length_weight = max(int(cfg.get("length_weight", 70) or 70), 0)
+        raw_match_weight = max(int(cfg.get("match_weight", 30) or 30), 0)
+        if raw_length_weight == 0 and raw_match_weight == 0:
+            raw_length_weight, raw_match_weight = 70, 30
+        total_weight = raw_length_weight + raw_match_weight
+        self.score_length_weight = int(round(raw_length_weight * 100.0 / total_weight))
+        self.score_match_weight = max(100 - self.score_length_weight, 0)
 
         self.score_base = int(cfg.get("base_score", 18) or 18)
 
@@ -1482,7 +1490,7 @@ class TextMatcher:
 
         if self.score_enabled:
             logging.info(
-                f"启用质量评分过滤。阈值: {self.score_threshold}，加权关键词: {len(self.score_weighted_keywords)}，标签惩罚词: {len(self.score_tail_drain_word_penalties)}，算法词库: {len(self.alg_problem_patterns)} 题/{len(self.alg_topic_patterns)} 类，面试高频: {len(self.alg_hot_problem_entries)} 条，并行评分线程: {self.score_parallel_workers}，异步构建: {self.score_async_build}"
+                f"启用质量评分过滤。阈值: {self.score_threshold}，长度/匹配配比: {self.score_length_weight}/{self.score_match_weight}，加权关键词: {len(self.score_weighted_keywords)}，标签惩罚词: {len(self.score_tail_drain_word_penalties)}，算法词库: {len(self.alg_problem_patterns)} 题/{len(self.alg_topic_patterns)} 类，面试高频: {len(self.alg_hot_problem_entries)} 条，并行评分线程: {self.score_parallel_workers}，异步构建: {self.score_async_build}"
             )
 
     def _prepare_weighted_keywords(self, weighted_keywords) -> list:
@@ -2683,13 +2691,15 @@ class TextMatcher:
 
         content_chars = len(re.sub(r"\s+", "", normalized_content))
         if content_chars <= 0:
-            length_score = 0
+            length_ratio = 0.0
         else:
-            ratio = min(content_chars / float(self.score_length_ideal_chars), 1.0)
-            length_score = int(round(self.score_length_max_score * ratio))
-
-        if 0 < content_chars < self.score_length_min_chars:
-            length_score = min(length_score, max(self.score_length_max_score // 4, 4))
+            length_ratio = min(content_chars / float(self.score_length_ideal_chars), 1.0)
+            if content_chars < self.score_length_min_chars:
+                length_ratio *= 0.35
+            elif content_chars < self.score_short_content_chars:
+                length_ratio *= 0.75
+        length_ratio = min(max(length_ratio, 0.0), 1.0)
+        length_score = int(round(self.score_length_weight * length_ratio))
 
         short_penalty = 0
         if 0 < content_chars < self.score_short_content_chars:
@@ -2712,22 +2722,35 @@ class TextMatcher:
 
         tail_drain_penalty = min(tail_drain_penalty, self.score_tail_drain_penalty_cap)
 
-        final_score = (
-            self.score_base
-            + title_score
-            + content_score
-            + weighted_score
-            + alg_score
-            + length_score
-            - short_penalty
-            - tail_tag_penalty
-            - tail_drain_penalty
-        )
-        final_score = max(int(final_score), 0)
+        match_signal_score = title_score + content_score + weighted_score + alg_score
+        match_signal_cap = self.score_title_hit_cap + self.score_content_hit_cap + self.score_weighted_keyword_cap
+        if self.score_alg_enabled:
+            match_signal_cap += self.score_alg_total_cap
+        match_signal_cap = max(match_signal_cap, 1)
+
+        raw_match_ratio = min(match_signal_score / float(match_signal_cap), 1.0)
+
+        tail_penalty_cap = max(self.score_tail_tag_penalty_cap + self.score_tail_drain_penalty_cap, 1)
+        tail_penalty_ratio = min((tail_tag_penalty + tail_drain_penalty) / float(tail_penalty_cap), 1.0)
+
+        short_ratio_penalty = 0.0
+        if 0 < content_chars < self.score_short_content_chars:
+            short_ratio_penalty = min(
+                (self.score_short_content_chars - content_chars) / float(max(self.score_short_content_chars, 1)),
+                1.0,
+            ) * 0.35
+
+        effective_match_ratio = max(raw_match_ratio * (1.0 - tail_penalty_ratio) - short_ratio_penalty, 0.0)
+        effective_match_ratio = min(effective_match_ratio, 1.0)
+        match_score = int(round(self.score_match_weight * effective_match_ratio))
+
+        final_score = max(min(int(length_score + match_score), 100), 0)
 
         passed = final_score >= self.score_threshold
         breakdown = {
-            "base_score": self.score_base,
+            "score_model": "length70_match30",
+            "length_weight": self.score_length_weight,
+            "match_weight": self.score_match_weight,
             "title_score": title_score,
             "content_score": content_score,
             "weighted_keyword_score": weighted_score,
@@ -2740,9 +2763,17 @@ class TextMatcher:
             "alg_hot_title_score": alg_signal.get("hot_title_score", 0),
             "alg_hot_id_score": alg_signal.get("hot_id_score", 0),
             "length_score": length_score,
+            "match_score": match_score,
+            "length_ratio": round(length_ratio, 4),
+            "match_ratio": round(effective_match_ratio, 4),
+            "raw_match_ratio": round(raw_match_ratio, 4),
+            "match_signal_score": match_signal_score,
+            "match_signal_cap": match_signal_cap,
             "short_penalty": short_penalty,
+            "short_ratio_penalty": round(short_ratio_penalty, 4),
             "tail_tag_penalty": tail_tag_penalty,
             "tail_drain_penalty": tail_drain_penalty,
+            "tail_penalty_ratio": round(tail_penalty_ratio, 4),
             "content_chars": content_chars,
             "title_matches": sorted(title_matched),
             "content_matches": sorted(content_matched),
@@ -2760,7 +2791,7 @@ class TextMatcher:
 
         if self.score_debug_log and logging.getLogger().isEnabledFor(logging.INFO):
             logging.info(
-                f"[{self.algo_name}] 质量评分: {final_score}/{self.score_threshold} | 题分={title_score} 文分={content_score} 词分={weighted_score} 算法分={alg_score} 高频题分={alg_signal.get('hot_score', 0)} 长度分={length_score} 惩罚={short_penalty + tail_tag_penalty + tail_drain_penalty}"
+                f"[{self.algo_name}] 质量评分: {final_score}/{self.score_threshold} | 长度分={length_score} 匹配分={match_score} | 长度比={length_ratio:.2f} 匹配比={effective_match_ratio:.2f} | 字数={content_chars}"
             )
 
         return {

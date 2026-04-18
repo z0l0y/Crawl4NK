@@ -79,26 +79,24 @@ def _candidate_config_files() -> List[Path]:
     advanced = CONFIG_DIR / "advanced.json"
     advanced_tpl = CONFIG_DIR / "advanced.template.json"
     app = CONFIG_DIR / "app.json"
+    app_tpl = CONFIG_DIR / "app.template.json"
     debug = CONFIG_DIR / "debug.json"
+    debug_tpl = CONFIG_DIR / "debug.template.json"
 
+    if advanced_tpl.exists():
+        files.append(advanced_tpl)
     if advanced.exists():
         files.append(advanced)
-    elif advanced_tpl.exists():
-        files.append(advanced_tpl)
 
+    if debug_tpl.exists():
+        files.append(debug_tpl)
     if debug.exists():
         files.append(debug)
-    else:
-        debug_tpl = CONFIG_DIR / "debug.template.json"
-        if debug_tpl.exists():
-            files.append(debug_tpl)
 
+    if app_tpl.exists():
+        files.append(app_tpl)
     if app.exists():
         files.append(app)
-    else:
-        app_tpl = CONFIG_DIR / "app.template.json"
-        if app_tpl.exists():
-            files.append(app_tpl)
 
     local_override = CONFIG_DIR / "local.override.json"
     if local_override.exists():

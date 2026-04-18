@@ -8,6 +8,7 @@ from typing import Dict, List
 import pandas as pd
 import requests
 
+
 class DataProcessor:
     NOISE_WORDS = {
         "java", "python", "golang", "go", "c++", "cpp", "javascript", "js", "sql",
@@ -21,7 +22,8 @@ class DataProcessor:
     NON_COMPANY_FRAGMENTS = {
         "面经", "慎投", "保姆级", "教学", "双非", "纯八股", "八股", "不感兴趣",
         "三月", "四月", "事业部", "合集", "攻略", "经验贴", "问答",
-        "大厂", "小厂", "怒砍", "这些公司", "总结...."
+        "大厂", "小厂", "怒砍", "这些公司", "总结....",
+        "没有公司", "无公司", "公司名", "公司名称"
     }
 
     COMPANY_ALIAS_MAP = {
@@ -31,13 +33,33 @@ class DataProcessor:
         "飞书": "字节",
         "豆包": "字节",
         "抖音": "字节",
+        "今日头条": "字节",
+        "番茄小说": "字节",
+        "番茄畅听": "字节",
+        "西瓜视频": "字节",
+        "火山引擎": "字节",
+        "巨量引擎": "字节",
+        "剪映": "字节",
+        "抖音电商": "字节",
+        "懂车帝": "字节",
+        "荣耀": "字节",
         "阿里巴巴": "阿里",
         "淘天": "阿里",
         "蚂蚁": "阿里",
+        "蚂蚁集团": "阿里",
+        "蚂蚁金服": "阿里",
         "支付宝": "阿里",
+        "菜鸟网络": "阿里",
+        "饿了么": "阿里",
+        "高德地图": "阿里",
         "qq": "腾讯",
         "微信": "腾讯",
         "wechat": "腾讯",
+        "qq音乐": "腾讯",
+        "腾讯视频": "腾讯",
+        "微信视频号": "腾讯",
+        "美团点评": "美团",
+        "京东数科": "京东",
         "pdd": "拼多多",
         "shopee": "虾皮",
         "哔哩哔哩": "b站",
@@ -49,10 +71,65 @@ class DataProcessor:
     PRODUCT_ALIAS_TO_COMPANY = {
         "飞书": "字节",
         "豆包": "字节",
+        "番茄小说": "字节",
+        "番茄畅听": "字节",
+        "西瓜视频": "字节",
+        "火山引擎": "字节",
+        "巨量引擎": "字节",
+        "剪映": "字节",
+        "今日头条": "字节",
+        "懂车帝": "字节",
         "支付宝": "阿里",
+        "高德地图": "阿里",
+        "饿了么": "阿里",
         "微信": "腾讯",
-        "QQ": "腾讯"
+        "QQ": "腾讯",
+        "QQ音乐": "腾讯"
     }
+
+    TITLE_NICKNAME_TO_COMPANY = {
+        "鹅厂": "腾讯",
+        "tx": "腾讯",
+        "ali": "阿里",
+        "猪厂": "网易",
+        "拼夕夕": "拼多多",
+        "bili": "b站",
+        "菊厂": "华为",
+    }
+
+    OWNER_ALIAS_TO_COMPANY_DEFAULT = {
+        "懂车帝": "字节",
+        "荣耀": "字节",
+        "番茄小说": "字节",
+        "番茄畅听": "字节",
+        "西瓜视频": "字节",
+        "火山引擎": "字节",
+        "巨量引擎": "字节",
+        "剪映": "字节",
+        "今日头条": "字节",
+        "抖音电商": "字节",
+        "高德地图": "阿里",
+        "饿了么": "阿里",
+        "菜鸟网络": "阿里",
+        "QQ音乐": "腾讯",
+        "腾讯视频": "腾讯",
+        "微信视频号": "腾讯",
+    }
+
+    OWNER_RELATION_HINTS = (
+        "是哪个公司的",
+        "属于",
+        "旗下",
+        "母公司",
+        "控股",
+        "集团",
+    )
+
+    GENERIC_NON_COMPANY_PATTERNS = (
+        r"(没有|无|不含|缺少).{0,4}(公司|厂|企业)",
+        r"(公司|企业).{0,4}(没有|无|不含|缺少)",
+        r"(公司名|公司名称|公司简称)",
+    )
 
     def __init__(self, data: List[Dict], config: Dict = None):
         self.data = data
@@ -66,16 +143,23 @@ class DataProcessor:
         self.include_id_column = bool(self.config.get("include_id_column", False))
         self.include_algorithm_annotations = bool(self.config.get("include_algorithm_annotations", True))
         self.drop_unknown_company_posts = bool(self.config.get("drop_unknown_company_posts", True))
+        self.require_company_in_title = bool(self.config.get("require_company_in_title", True))
+        self.company_owner_inference_enabled = bool(self.config.get("company_owner_inference_enabled", True))
+        self.company_owner_query_timeout = float(self.config.get("company_owner_query_timeout", 6) or 6)
+        self.company_owner_max_suggestions = max(int(self.config.get("company_owner_max_suggestions", 12) or 12), 5)
         self.filtered_posts_log = bool(self.config.get("filtered_posts_log", False))
         self.filtered_posts_log_limit = int(self.config.get("filtered_posts_log_limit", 50) or 50)
         self.max_items_per_keyword = int(self.config.get("max_items_per_keyword", 0) or 0)
         self.dropped_unknown_company_count = 0
         self.dropped_unknown_company_examples = []
-        self.unknown_company_fallback_used_count = 0
 
         self.companies = self._load_companies()
+        self.owner_alias_to_company = self._load_owner_aliases()
+        self.dynamic_verify_skip_tokens = self._build_dynamic_verify_skip_tokens()
 
         self.company_cache = {}
+        self.owner_company_cache = {}
+        self.baidu_suggestion_cache = {}
 
     def _load_companies(self) -> set:
         companies = set()
@@ -101,6 +185,41 @@ class DataProcessor:
                 self._company_log(f"[Debug] 跳过可疑公司词: '{company_name}'")
 
         return companies
+
+    def _load_owner_aliases(self) -> Dict[str, str]:
+        merged = dict(self.OWNER_ALIAS_TO_COMPANY_DEFAULT)
+
+        configured = self.config.get("company_owner_aliases", {})
+        if isinstance(configured, dict):
+            for raw_alias, raw_company in configured.items():
+                alias = str(raw_alias or "").strip()
+                company = str(raw_company or "").strip()
+                if not alias or not company:
+                    continue
+                merged[alias] = company
+
+        normalized = {}
+        for alias, company in merged.items():
+            alias_token = str(alias or "").strip()
+            company_token = self._normalize_company_name(str(company or "").strip())
+            if alias_token and company_token:
+                normalized[alias_token] = company_token
+
+        return normalized
+
+    def _build_dynamic_verify_skip_tokens(self) -> set:
+        tokens = set()
+        for alias_map in (
+            self.PRODUCT_ALIAS_TO_COMPANY,
+            self.TITLE_NICKNAME_TO_COMPANY,
+            self.owner_alias_to_company,
+            self.COMPANY_ALIAS_MAP,
+        ):
+            for alias in alias_map.keys():
+                alias_token = str(alias or "").strip().lower()
+                if alias_token:
+                    tokens.add(alias_token)
+        return tokens
 
     def _company_log(self, message: str):
         if self.company_debug_log:
@@ -145,6 +264,17 @@ class DataProcessor:
         lower_word = word.lower()
         return lower_word in self.NOISE_WORDS
 
+    def _is_generic_non_company_phrase(self, word: str) -> bool:
+        token = str(word or "").strip().lower()
+        if not token:
+            return True
+
+        for pattern in self.GENERIC_NON_COMPANY_PATTERNS:
+            if re.search(pattern, token):
+                return True
+
+        return False
+
     def _is_plausible_company_name(self, name: str) -> bool:
         word = (name or "").strip()
         if not word:
@@ -152,6 +282,8 @@ class DataProcessor:
         if len(word) < 2 or len(word) > 25:
             return False
         if word.isdigit() or self._is_noise_token(word):
+            return False
+        if self._is_generic_non_company_phrase(word):
             return False
 
         if any(fragment in word for fragment in self.NON_COMPANY_FRAGMENTS):
@@ -164,7 +296,26 @@ class DataProcessor:
             return False
 
         if re.fullmatch(r"[\u4e00-\u9fff]{9,}", word) and not any(
-            marker in word for marker in ("科技", "集团", "有限公司", "控股", "金融", "网络", "信息", "软件", "云计算")
+            marker in word
+            for marker in (
+                "科技",
+                "集团",
+                "有限公司",
+                "控股",
+                "金融",
+                "网络",
+                "信息",
+                "软件",
+                "云计算",
+                "研究院",
+                "研究所",
+                "中心",
+                "银行",
+                "证券",
+                "电信",
+                "移动",
+                "联通",
+            )
         ):
             return False
 
@@ -197,8 +348,12 @@ class DataProcessor:
 
         source_weight = {
             "product_alias": 130,
+            "owner_alias": 126,
+            "nickname_alias": 120,
+            "alias_map": 110,
             "known_company": 100,
             "dynamic_verified": 95,
+            "owner_inferred": 92,
             "title_pattern": 70
         }.get(source, 60)
 
@@ -291,6 +446,101 @@ class DataProcessor:
         score = mentions + prefix_hits + (weak_hits * 2) + (strong_hits * 3) - negative_hits
         return mentions >= 2 and score >= 6
 
+    def _query_baidu_suggestions(self, keyword: str) -> List[str]:
+        token = str(keyword or "").strip()
+        if not token:
+            return []
+
+        if token in self.baidu_suggestion_cache:
+            return self.baidu_suggestion_cache[token]
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        }
+        suggestions: List[str] = []
+
+        try:
+            sugg_url = f"https://www.baidu.com/sugrec?prod=pc&wd={urllib.parse.quote(token)}"
+            sugg_resp = requests.get(sugg_url, headers=headers, timeout=self.company_owner_query_timeout)
+            if sugg_resp.status_code == 200:
+                data = sugg_resp.json()
+                suggestions = [item.get("q", "") for item in data.get("g", []) if isinstance(item, dict)]
+        except Exception as e:
+            self._company_log(f"[Debug] 请求建议词失败: {e}")
+
+        self.baidu_suggestion_cache[token] = suggestions
+        return suggestions
+
+    def _infer_owner_company_from_suggestions(self, word: str, suggestions: List[str]) -> str:
+        if not suggestions:
+            return ""
+
+        alias_to_company = {}
+        for comp in self.companies:
+            alias_to_company[comp] = comp
+        alias_to_company.update(self.COMPANY_ALIAS_MAP)
+        alias_to_company.update(self.PRODUCT_ALIAS_TO_COMPANY)
+        alias_to_company.update(self.TITLE_NICKNAME_TO_COMPANY)
+        alias_to_company.update(self.owner_alias_to_company)
+
+        company_scores = {}
+        for suggestion in suggestions[: self.company_owner_max_suggestions]:
+            text = str(suggestion or "").strip()
+            if not text:
+                continue
+
+            relation_bonus = 2 if any(hint in text for hint in self.OWNER_RELATION_HINTS) else 0
+            word_bonus = 1 if self._title_contains_token(text, word) else 0
+
+            for alias, company in alias_to_company.items():
+                alias_token = str(alias or "").strip()
+                company_token = self._normalize_company_name(str(company or "").strip())
+                if not alias_token or not company_token:
+                    continue
+                if not self._title_contains_token(text, alias_token):
+                    continue
+
+                gain = 2 + relation_bonus + word_bonus
+                company_scores[company_token] = company_scores.get(company_token, 0) + gain
+
+        if not company_scores:
+            return ""
+
+        best_company, best_score = max(company_scores.items(), key=lambda item: item[1])
+        if best_score < 4:
+            return ""
+
+        return best_company
+
+    def _infer_owner_company_online(self, word: str) -> str:
+        if not self.company_owner_inference_enabled:
+            return ""
+
+        token = str(word or "").strip()
+        if len(token) < 2:
+            return ""
+
+        if token in self.owner_company_cache:
+            return self.owner_company_cache[token]
+
+        for alias, company in self.owner_alias_to_company.items():
+            if self._title_contains_token(token, alias):
+                resolved = self._normalize_company_name(company)
+                self.owner_company_cache[token] = resolved
+                return resolved
+
+        suggestions = self._query_baidu_suggestions(token)
+        inferred = self._infer_owner_company_from_suggestions(token, suggestions)
+
+        if not inferred:
+            owner_query = f"{token}是哪个公司的"
+            owner_suggestions = self._query_baidu_suggestions(owner_query)
+            inferred = self._infer_owner_company_from_suggestions(token, owner_suggestions)
+
+        self.owner_company_cache[token] = inferred or ""
+        return inferred or ""
+
     def _verify_company_online(self, word: str) -> bool:
         word = (word or "").strip()
         if len(word) < 2 or len(word) > 20:
@@ -311,7 +561,7 @@ class DataProcessor:
         try:
             time.sleep(0.25)
             aiqicha_url = f"https://aiqicha.baidu.com/s?q={urllib.parse.quote(word)}&t=0"
-            resp = requests.get(aiqicha_url, headers=headers, timeout=6)
+            resp = requests.get(aiqicha_url, headers=headers, timeout=self.company_owner_query_timeout)
 
             if resp.status_code == 200:
                 text = resp.text
@@ -328,19 +578,13 @@ class DataProcessor:
         except Exception as e:
             self._company_log(f"[Debug] 请求爱企查校验失败: {e}")
 
-        try:
-            sugg_url = f"https://www.baidu.com/sugrec?prod=pc&wd={urllib.parse.quote(word)}"
-            sugg_resp = requests.get(sugg_url, headers={"User-Agent": headers["User-Agent"]}, timeout=6)
-            if sugg_resp.status_code == 200:
-                data = sugg_resp.json()
-                suggestions = [item.get("q", "") for item in data.get("g", []) if isinstance(item, dict)]
-                is_company = self._is_company_by_suggestions(word, suggestions)
-                self.company_cache[word] = is_company
-                if is_company:
-                    self._company_log(f"[-] 动态检测到新公司(建议词): '{word}'")
-                return is_company
-        except Exception as e:
-            self._company_log(f"[Debug] 请求建议词校验公司失败: {e}")
+        suggestions = self._query_baidu_suggestions(word)
+        if suggestions:
+            is_company = self._is_company_by_suggestions(word, suggestions)
+            self.company_cache[word] = is_company
+            if is_company:
+                self._company_log(f"[-] 动态检测到新公司(建议词): '{word}'")
+            return is_company
 
         self.company_cache[word] = False
         return False
@@ -391,6 +635,18 @@ class DataProcessor:
             if self._title_contains_token(title, alias):
                 add_candidate(company_name, alias, "product_alias")
 
+        for alias, company_name in self.TITLE_NICKNAME_TO_COMPANY.items():
+            if self._title_contains_token(title, alias):
+                add_candidate(company_name, alias, "nickname_alias")
+
+        for alias, company_name in self.owner_alias_to_company.items():
+            if self._title_contains_token(title, alias):
+                add_candidate(company_name, alias, "owner_alias")
+
+        for alias, company_name in self.COMPANY_ALIAS_MAP.items():
+            if self._title_contains_token(title, alias):
+                add_candidate(company_name, alias, "alias_map")
+
         for comp in self.companies:
             if not self._is_plausible_company_name(comp):
                 continue
@@ -414,12 +670,22 @@ class DataProcessor:
                 if not self._looks_like_company_token(p_clean):
                     continue
 
+                if p_clean.lower() in self.dynamic_verify_skip_tokens:
+                    continue
+
                 normalized = self._normalize_company_name(p_clean)
                 existing = candidates.get(normalized)
-                if existing and existing.get("source") in ("product_alias", "known_company"):
+                if existing and existing.get("source") in ("product_alias", "owner_alias", "known_company"):
+                    continue
+
+                if any(
+                    existing_company != normalized and self._title_contains_token(p_clean, existing_company)
+                    for existing_company in candidates.keys()
+                ):
                     continue
 
                 if normalized.lower() != p_clean.lower():
+                    add_candidate(normalized, p_clean, "alias_map")
                     continue
 
                 self._company_log(f"[Debug] 开始在线校验可能的新公司: '{p_clean}' (来自标题: '{title}')")
@@ -429,7 +695,12 @@ class DataProcessor:
                         self._save_new_company_to_config(p_clean)
                     add_candidate(normalized, p_clean, "dynamic_verified")
                 else:
-                    self._company_log(f"[Debug] 校验失败，该词被认为不是公司名: '{p_clean}'")
+                    inferred_owner = self._infer_owner_company_online(p_clean)
+                    if inferred_owner:
+                        add_candidate(inferred_owner, p_clean, "owner_inferred")
+                        self._company_log(f"[-] 归属推断命中: '{p_clean}' -> '{inferred_owner}'")
+                    else:
+                        self._company_log(f"[Debug] 校验失败，该词被认为不是公司名: '{p_clean}'")
 
         if not candidates:
             self._company_log("[DataProcessor] 提取到的公司名称为: '其他'")
@@ -532,85 +803,25 @@ class DataProcessor:
         if self.show_progress_bar and not self.company_debug_log:
             self._render_progress(current, total, "清洗打标进度")
 
-    def _handle_unknown_company_record(
-        self,
-        keyword: str,
-        title: str,
-        url: str,
-        record: Dict,
-        unknown_pool_records: Dict,
-        unknown_pool_examples: Dict,
-    ):
+    def _record_dropped_unknown_company(self, keyword: str, title: str, url: str):
         unknown_example = {
             "title": title,
             "keyword": keyword,
             "url": url,
         }
-
-        if keyword:
-            unknown_pool_records.setdefault(keyword, []).append(record)
-            unknown_pool_examples.setdefault(keyword, []).append(unknown_example)
-        else:
-            self.dropped_unknown_company_count += 1
-            self.dropped_unknown_company_examples.append(unknown_example)
-
-    def _apply_unknown_company_fallback(
-        self,
-        cleaned_data: List[Dict],
-        kept_keyword_counter: Dict,
-        keyword_seen_order: List[str],
-        unknown_pool_records: Dict,
-        unknown_pool_examples: Dict,
-    ):
-        if not self.drop_unknown_company_posts:
-            return
-
-        if self.max_items_per_keyword > 0:
-            for keyword in keyword_seen_order:
-                unknown_records = unknown_pool_records.get(keyword, [])
-                unknown_examples = unknown_pool_examples.get(keyword, [])
-                if not unknown_records:
-                    continue
-
-                current = kept_keyword_counter.get(keyword, 0)
-                need = max(self.max_items_per_keyword - current, 0)
-                use_count = min(need, len(unknown_records))
-
-                if use_count > 0:
-                    cleaned_data.extend(unknown_records[:use_count])
-                    kept_keyword_counter[keyword] = current + use_count
-                    self.unknown_company_fallback_used_count += use_count
-
-                remaining_examples = unknown_examples[use_count:]
-                if remaining_examples:
-                    self.dropped_unknown_company_count += len(remaining_examples)
-                    self.dropped_unknown_company_examples.extend(remaining_examples)
-            return
-
-        for keyword in keyword_seen_order:
-            unknown_examples = unknown_pool_examples.get(keyword, [])
-            if unknown_examples:
-                self.dropped_unknown_company_count += len(unknown_examples)
-                self.dropped_unknown_company_examples.extend(unknown_examples)
+        self.dropped_unknown_company_count += 1
+        self.dropped_unknown_company_examples.append(unknown_example)
 
     def process(self):
         cleaned_data = []
         self.dropped_unknown_company_count = 0
         self.dropped_unknown_company_examples = []
-        self.unknown_company_fallback_used_count = 0
         kept_keyword_counter = {}
-        keyword_seen_order = []
-        keyword_seen_set = set()
-        unknown_pool_records = {}
-        unknown_pool_examples = {}
         expected_columns = self._build_expected_columns()
 
         total_items = len(self.data)
         for idx, item in enumerate(self.data, start=1):
             keyword = item.get("keyword", "")
-            if keyword and keyword not in keyword_seen_set:
-                keyword_seen_set.add(keyword)
-                keyword_seen_order.append(keyword)
 
             if self.max_items_per_keyword > 0 and keyword:
                 if kept_keyword_counter.get(keyword, 0) >= self.max_items_per_keyword:
@@ -624,14 +835,12 @@ class DataProcessor:
             company = self._extract_company(title, content)
             record = self._build_clean_record(item, title, company, keyword, content, comments)
 
-            if self.drop_unknown_company_posts and company == "其他":
-                self._handle_unknown_company_record(
+            should_drop_unknown = self.drop_unknown_company_posts or self.require_company_in_title
+            if should_drop_unknown and company == "其他":
+                self._record_dropped_unknown_company(
                     keyword=keyword,
                     title=title,
                     url=item.get("url", ""),
-                    record=record,
-                    unknown_pool_records=unknown_pool_records,
-                    unknown_pool_examples=unknown_pool_examples,
                 )
                 self._render_clean_progress(idx, total_items)
                 continue
@@ -641,14 +850,6 @@ class DataProcessor:
                 kept_keyword_counter[keyword] = kept_keyword_counter.get(keyword, 0) + 1
 
             self._render_clean_progress(idx, total_items)
-
-        self._apply_unknown_company_fallback(
-            cleaned_data=cleaned_data,
-            kept_keyword_counter=kept_keyword_counter,
-            keyword_seen_order=keyword_seen_order,
-            unknown_pool_records=unknown_pool_records,
-            unknown_pool_examples=unknown_pool_examples,
-        )
 
         df = pd.DataFrame(cleaned_data, columns=expected_columns)
         return df
@@ -796,10 +997,8 @@ class DataProcessor:
         print("\n--- 爬取数据总况 ---")
         print(f"总计爬取帖子数量: {len(df)}")
 
-        if self.drop_unknown_company_posts and self.unknown_company_fallback_used_count > 0:
-            print(f"为补齐每关键词配额，已回补未识别公司帖子: {self.unknown_company_fallback_used_count} 篇")
-
-        if self.drop_unknown_company_posts and self.dropped_unknown_company_count > 0:
+        should_drop_unknown = self.drop_unknown_company_posts or self.require_company_in_title
+        if should_drop_unknown and self.dropped_unknown_company_count > 0:
             print(f"已过滤未识别公司帖子: {self.dropped_unknown_company_count} 篇")
 
             if self.filtered_posts_log:
