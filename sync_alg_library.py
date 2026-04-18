@@ -430,13 +430,17 @@ def update_alg_json(alg_json_path: str, hot_entries: List[Dict]):
     alg["problem_titles"] = problem_titles
     alg["interview_hot_problems"] = slim_hot_entries
 
+    output_dir = os.path.dirname(os.path.abspath(alg_json_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     with open(alg_json_path, "w", encoding="utf-8") as f:
         json.dump(alg, f, ensure_ascii=False, indent=2)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Sync alg.json hot problems from remote API and optional raw markdown list.")
-    parser.add_argument("--alg-json", default="alg.json", help="alg.json path to update")
+    parser.add_argument("--alg-json", default=os.path.join("data", "algorithms", "alg.json"), help="alg.json path to update")
     parser.add_argument("--raw-md", default=os.path.join("..", "RAW", "alg.md"), help="optional raw markdown source")
     parser.add_argument("--skip-codetop", action="store_true", help="skip fetching codetop API")
     parser.add_argument("--timeout", type=int, default=20, help="HTTP timeout seconds")

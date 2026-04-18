@@ -1,15 +1,66 @@
+import json
+import os
 import re
-import pandas as pd
-from typing import List, Dict
-import requests
 import time
 import urllib.parse
+from typing import Dict, List
+
+import pandas as pd
+import requests
 
 class DataProcessor:
+    NOISE_WORDS = {
+        "java", "python", "golang", "go", "c++", "cpp", "javascript", "js", "sql",
+        "前端", "后端", "算法", "测试", "开发", "研发", "产品", "运营", "设计", "运维",
+        "工程师", "面试", "面经", "实习", "校招", "秋招", "春招", "offer", "八股", "笔试",
+        "高级", "中级", "初级", "资深", "专家", "总监", "主管", "leader", "岗位", "职位", "方向",
+        "总结", "分享", "记录", "经验", "题目", "题解", "教程", "攻略", "agent",
+        "大厂", "小厂", "信息", "慎投", "双非"
+    }
+
+    NON_COMPANY_FRAGMENTS = {
+        "面经", "慎投", "保姆级", "教学", "双非", "纯八股", "八股", "不感兴趣",
+        "三月", "四月", "事业部", "合集", "攻略", "经验贴", "问答",
+        "大厂", "小厂", "怒砍", "这些公司", "总结...."
+    }
+
+    COMPANY_ALIAS_MAP = {
+        "字节跳动": "字节",
+        "字节跳动tiktok": "字节",
+        "tiktok": "字节",
+        "飞书": "字节",
+        "豆包": "字节",
+        "抖音": "字节",
+        "阿里巴巴": "阿里",
+        "淘天": "阿里",
+        "蚂蚁": "阿里",
+        "支付宝": "阿里",
+        "qq": "腾讯",
+        "微信": "腾讯",
+        "wechat": "腾讯",
+        "pdd": "拼多多",
+        "shopee": "虾皮",
+        "哔哩哔哩": "b站",
+        "bilibili": "b站",
+        "腾讯teg": "腾讯",
+        "腾讯云": "腾讯"
+    }
+
+    PRODUCT_ALIAS_TO_COMPANY = {
+        "飞书": "字节",
+        "豆包": "字节",
+        "支付宝": "阿里",
+        "微信": "腾讯",
+        "QQ": "腾讯"
+    }
+
     def __init__(self, data: List[Dict], config: Dict = None):
         self.data = data
         self.config = config or {}
-        self.config_path = "companies.json"
+        self.config_path = str(
+            self.config.get("companies_path", "data/companies/companies.json")
+            or "data/companies/companies.json"
+        )
         self.company_debug_log = bool(self.config.get("company_debug_log", False))
         self.show_progress_bar = bool(self.config.get("show_progress_bar", True))
         self.include_id_column = bool(self.config.get("include_id_column", False))
@@ -21,25 +72,35 @@ class DataProcessor:
         self.dropped_unknown_company_count = 0
         self.dropped_unknown_company_examples = []
         self.unknown_company_fallback_used_count = 0
-        
-        self.companies = set()
-        try:
-            import json, os
-            if os.path.exists(self.config_path):
-                with open(self.config_path, 'r', encoding='utf-8') as f:
-                    config_data = json.load(f)
-                    if isinstance(config_data, list):
-                        for company_name in config_data:
-                            if self._is_plausible_company_name(company_name):
-                                self.companies.add(company_name)
-                            else:
-                                self._company_log(f"[Debug] 跳过可疑公司词: '{company_name}'")
-            else:
-                print(f"[警告] 未找到 {self.config_path} 文件，公司匹配库目前为空！")
-        except Exception as e:
-            print(f"[错误] 读取 {self.config_path} 失败: {e}")
+
+        self.companies = self._load_companies()
 
         self.company_cache = {}
+
+    def _load_companies(self) -> set:
+        companies = set()
+
+        if not os.path.exists(self.config_path):
+            print(f"[警告] 未找到 {self.config_path} 文件，公司匹配库目前为空！")
+            return companies
+
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                config_data = json.load(f)
+        except Exception as e:
+            print(f"[错误] 读取 {self.config_path} 失败: {e}")
+            return companies
+
+        if not isinstance(config_data, list):
+            return companies
+
+        for company_name in config_data:
+            if self._is_plausible_company_name(company_name):
+                companies.add(company_name)
+            else:
+                self._company_log(f"[Debug] 跳过可疑公司词: '{company_name}'")
+
+        return companies
 
     def _company_log(self, message: str):
         if self.company_debug_log:
@@ -62,15 +123,17 @@ class DataProcessor:
             return
 
         try:
-            import json, os
             config_data = []
             if os.path.exists(self.config_path):
-                with open(self.config_path, 'r', encoding='utf-8') as f:
+                with open(self.config_path, "r", encoding="utf-8") as f:
                     config_data = json.load(f)
-            
+
             if new_company not in config_data:
                 config_data.append(new_company)
-                with open(self.config_path, 'w', encoding='utf-8') as f:
+                dir_path = os.path.dirname(self.config_path)
+                if dir_path:
+                    os.makedirs(dir_path, exist_ok=True)
+                with open(self.config_path, "w", encoding="utf-8") as f:
                     json.dump(config_data, f, ensure_ascii=False, indent=4)
                 self._company_log(f"[*] 持久化: 已将新公司 '{new_company}' 保存至 {self.config_path}。")
         except Exception as e:
@@ -80,15 +143,7 @@ class DataProcessor:
         if not word:
             return True
         lower_word = word.lower()
-        noise_words = {
-            "java", "python", "golang", "go", "c++", "cpp", "javascript", "js", "sql",
-            "前端", "后端", "算法", "测试", "开发", "研发", "产品", "运营", "设计", "运维",
-            "工程师", "面试", "面经", "实习", "校招", "秋招", "春招", "offer", "八股", "笔试",
-            "高级", "中级", "初级", "资深", "专家", "总监", "主管", "leader", "岗位", "职位", "方向",
-            "总结", "分享", "记录", "经验", "题目", "题解", "教程", "攻略", "agent",
-            "大厂", "小厂", "信息", "慎投", "双非"
-        }
-        return lower_word in noise_words
+        return lower_word in self.NOISE_WORDS
 
     def _is_plausible_company_name(self, name: str) -> bool:
         word = (name or "").strip()
@@ -99,12 +154,7 @@ class DataProcessor:
         if word.isdigit() or self._is_noise_token(word):
             return False
 
-        non_company_fragments = {
-            "面经", "慎投", "保姆级", "教学", "双非", "纯八股", "八股", "不感兴趣",
-            "三月", "四月", "事业部", "合集", "攻略", "经验贴", "问答",
-            "大厂", "小厂", "怒砍", "这些公司", "总结...."
-        }
-        if any(fragment in word for fragment in non_company_fragments):
+        if any(fragment in word for fragment in self.NON_COMPANY_FRAGMENTS):
             return False
 
         if re.search(r"[?？!！]", word):
@@ -124,29 +174,7 @@ class DataProcessor:
         if not name:
             return name
 
-        alias_map = {
-            "字节跳动": "字节",
-            "字节跳动tiktok": "字节",
-            "tiktok": "字节",
-            "飞书": "字节",
-            "豆包": "字节",
-            "抖音": "字节",
-            "阿里巴巴": "阿里",
-            "淘天": "阿里",
-            "蚂蚁": "阿里",
-            "支付宝": "阿里",
-            "qq": "腾讯",
-            "微信": "腾讯",
-            "wechat": "腾讯",
-            "pdd": "拼多多",
-            "shopee": "虾皮",
-            "哔哩哔哩": "b站",
-            "bilibili": "b站",
-            "腾讯teg": "腾讯",
-            "腾讯云": "腾讯"
-        }
-
-        return alias_map.get(name.lower(), name)
+        return self.COMPANY_ALIAS_MAP.get(name.lower(), name)
 
     def _title_token_position(self, title: str, token: str) -> int:
         if not title or not token:
@@ -359,14 +387,7 @@ class DataProcessor:
             ):
                 candidates[company_name] = current
 
-        product_alias_to_company = {
-            "飞书": "字节",
-            "豆包": "字节",
-            "支付宝": "阿里",
-            "微信": "腾讯",
-            "QQ": "腾讯"
-        }
-        for alias, company_name in product_alias_to_company.items():
+        for alias, company_name in self.PRODUCT_ALIAS_TO_COMPANY.items():
             if self._title_contains_token(title, alias):
                 add_candidate(company_name, alias, "product_alias")
 
@@ -475,6 +496,103 @@ class DataProcessor:
 
         return "\n".join(lines)
 
+    def _build_expected_columns(self) -> List[str]:
+        columns = ["标题", "公司", "搜索关键词", "帖子链接", "正文", "评论及回复"]
+        if self.include_algorithm_annotations:
+            columns.append("算法标注")
+        if self.include_id_column:
+            columns = ["ID"] + columns
+        return columns
+
+    def _sanitize_html_text(self, text: str) -> str:
+        cleaned = re.sub(r"<br\s*/?>|</p>|</div>", "\n", str(text or ""), flags=re.IGNORECASE)
+        cleaned = re.sub(r"<[^>]+>", "", cleaned).strip()
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned
+
+    def _build_clean_record(self, item: Dict, title: str, company: str, keyword: str, content: str, comments: str) -> Dict:
+        record = {
+            "标题": title,
+            "公司": company,
+            "搜索关键词": keyword,
+            "帖子链接": item.get("url", ""),
+            "正文": content,
+            "评论及回复": comments,
+        }
+
+        if self.include_algorithm_annotations:
+            record["算法标注"] = self._format_algorithm_annotations(item.get("algorithm_matches", []))
+
+        if self.include_id_column:
+            record = {"ID": item.get("id"), **record}
+
+        return record
+
+    def _render_clean_progress(self, current: int, total: int):
+        if self.show_progress_bar and not self.company_debug_log:
+            self._render_progress(current, total, "清洗打标进度")
+
+    def _handle_unknown_company_record(
+        self,
+        keyword: str,
+        title: str,
+        url: str,
+        record: Dict,
+        unknown_pool_records: Dict,
+        unknown_pool_examples: Dict,
+    ):
+        unknown_example = {
+            "title": title,
+            "keyword": keyword,
+            "url": url,
+        }
+
+        if keyword:
+            unknown_pool_records.setdefault(keyword, []).append(record)
+            unknown_pool_examples.setdefault(keyword, []).append(unknown_example)
+        else:
+            self.dropped_unknown_company_count += 1
+            self.dropped_unknown_company_examples.append(unknown_example)
+
+    def _apply_unknown_company_fallback(
+        self,
+        cleaned_data: List[Dict],
+        kept_keyword_counter: Dict,
+        keyword_seen_order: List[str],
+        unknown_pool_records: Dict,
+        unknown_pool_examples: Dict,
+    ):
+        if not self.drop_unknown_company_posts:
+            return
+
+        if self.max_items_per_keyword > 0:
+            for keyword in keyword_seen_order:
+                unknown_records = unknown_pool_records.get(keyword, [])
+                unknown_examples = unknown_pool_examples.get(keyword, [])
+                if not unknown_records:
+                    continue
+
+                current = kept_keyword_counter.get(keyword, 0)
+                need = max(self.max_items_per_keyword - current, 0)
+                use_count = min(need, len(unknown_records))
+
+                if use_count > 0:
+                    cleaned_data.extend(unknown_records[:use_count])
+                    kept_keyword_counter[keyword] = current + use_count
+                    self.unknown_company_fallback_used_count += use_count
+
+                remaining_examples = unknown_examples[use_count:]
+                if remaining_examples:
+                    self.dropped_unknown_company_count += len(remaining_examples)
+                    self.dropped_unknown_company_examples.extend(remaining_examples)
+            return
+
+        for keyword in keyword_seen_order:
+            unknown_examples = unknown_pool_examples.get(keyword, [])
+            if unknown_examples:
+                self.dropped_unknown_company_count += len(unknown_examples)
+                self.dropped_unknown_company_examples.extend(unknown_examples)
+
     def process(self):
         cleaned_data = []
         self.dropped_unknown_company_count = 0
@@ -485,11 +603,7 @@ class DataProcessor:
         keyword_seen_set = set()
         unknown_pool_records = {}
         unknown_pool_examples = {}
-        expected_columns = ["标题", "公司", "搜索关键词", "帖子链接", "正文", "评论及回复"]
-        if self.include_algorithm_annotations:
-            expected_columns.append("算法标注")
-        if self.include_id_column:
-            expected_columns = ["ID"] + expected_columns
+        expected_columns = self._build_expected_columns()
 
         total_items = len(self.data)
         for idx, item in enumerate(self.data, start=1):
@@ -500,89 +614,41 @@ class DataProcessor:
 
             if self.max_items_per_keyword > 0 and keyword:
                 if kept_keyword_counter.get(keyword, 0) >= self.max_items_per_keyword:
-                    if self.show_progress_bar and not self.company_debug_log:
-                        self._render_progress(idx, total_items, "清洗打标进度")
+                    self._render_clean_progress(idx, total_items)
                     continue
 
             title = item.get("title", "")
-            content = item.get("content", "")
-            comments = "\n".join(item.get("comments", []))
-
-            content = re.sub(r'<br\s*/?>|</p>|</div>', '\n', content, flags=re.IGNORECASE)
-            content = re.sub(r'<[^>]+>', '', content).strip()
-            content = re.sub(r'\n{3,}', '\n\n', content)
-
-            comments = re.sub(r'<br\s*/?>|</p>|</div>', '\n', comments, flags=re.IGNORECASE)
-            comments = re.sub(r'<[^>]+>', '', comments).strip()
-            comments = re.sub(r'\n{3,}', '\n\n', comments)
+            content = self._sanitize_html_text(item.get("content", ""))
+            comments = self._sanitize_html_text("\n".join(item.get("comments", [])))
 
             company = self._extract_company(title, content)
-
-            record = {
-                "标题": title,
-                "公司": company,
-                "搜索关键词": keyword,
-                "帖子链接": item.get("url", ""),
-                "正文": content,
-                "评论及回复": comments
-            }
-            if self.include_algorithm_annotations:
-                record["算法标注"] = self._format_algorithm_annotations(item.get("algorithm_matches", []))
-            if self.include_id_column:
-                record = {"ID": item.get("id"), **record}
+            record = self._build_clean_record(item, title, company, keyword, content, comments)
 
             if self.drop_unknown_company_posts and company == "其他":
-                unknown_example = {
-                    "title": title,
-                    "keyword": keyword,
-                    "url": item.get("url", "")
-                }
-
-                if keyword:
-                    unknown_pool_records.setdefault(keyword, []).append(record)
-                    unknown_pool_examples.setdefault(keyword, []).append(unknown_example)
-                else:
-                    self.dropped_unknown_company_count += 1
-                    self.dropped_unknown_company_examples.append(unknown_example)
-
-                if self.show_progress_bar and not self.company_debug_log:
-                    self._render_progress(idx, total_items, "清洗打标进度")
+                self._handle_unknown_company_record(
+                    keyword=keyword,
+                    title=title,
+                    url=item.get("url", ""),
+                    record=record,
+                    unknown_pool_records=unknown_pool_records,
+                    unknown_pool_examples=unknown_pool_examples,
+                )
+                self._render_clean_progress(idx, total_items)
                 continue
 
             cleaned_data.append(record)
             if keyword:
                 kept_keyword_counter[keyword] = kept_keyword_counter.get(keyword, 0) + 1
 
-            if self.show_progress_bar and not self.company_debug_log:
-                self._render_progress(idx, total_items, "清洗打标进度")
+            self._render_clean_progress(idx, total_items)
 
-        if self.drop_unknown_company_posts:
-            if self.max_items_per_keyword > 0:
-                for keyword in keyword_seen_order:
-                    unknown_records = unknown_pool_records.get(keyword, [])
-                    unknown_examples = unknown_pool_examples.get(keyword, [])
-                    if not unknown_records:
-                        continue
-
-                    current = kept_keyword_counter.get(keyword, 0)
-                    need = max(self.max_items_per_keyword - current, 0)
-                    use_count = min(need, len(unknown_records))
-
-                    if use_count > 0:
-                        cleaned_data.extend(unknown_records[:use_count])
-                        kept_keyword_counter[keyword] = current + use_count
-                        self.unknown_company_fallback_used_count += use_count
-
-                    remaining_examples = unknown_examples[use_count:]
-                    if remaining_examples:
-                        self.dropped_unknown_company_count += len(remaining_examples)
-                        self.dropped_unknown_company_examples.extend(remaining_examples)
-            else:
-                for keyword in keyword_seen_order:
-                    unknown_examples = unknown_pool_examples.get(keyword, [])
-                    if unknown_examples:
-                        self.dropped_unknown_company_count += len(unknown_examples)
-                        self.dropped_unknown_company_examples.extend(unknown_examples)
+        self._apply_unknown_company_fallback(
+            cleaned_data=cleaned_data,
+            kept_keyword_counter=kept_keyword_counter,
+            keyword_seen_order=keyword_seen_order,
+            unknown_pool_records=unknown_pool_records,
+            unknown_pool_examples=unknown_pool_examples,
+        )
 
         df = pd.DataFrame(cleaned_data, columns=expected_columns)
         return df

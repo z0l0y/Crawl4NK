@@ -1422,9 +1422,10 @@ class TextMatcher:
         self.score_tail_drain_word_penalties = self._prepare_tail_drain_penalties(tail_drain_words_cfg)
 
         self.score_alg_enabled = bool(cfg.get("alg_enabled", True))
-        self.score_alg_path = str(cfg.get("alg_path", "alg.json") or "alg.json")
+        default_alg_path = os.path.join("data", "algorithms", "alg.json")
+        self.score_alg_path = str(cfg.get("alg_path", default_alg_path) or default_alg_path)
         if not os.path.isabs(self.score_alg_path):
-            self.score_alg_path = os.path.join(os.getcwd(), self.score_alg_path)
+            self.score_alg_path = os.path.join(os.path.dirname(__file__), self.score_alg_path)
 
         self.score_alg_total_cap = max(int(cfg.get("alg_total_cap", 60) or 60), 0)
         self.score_alg_marker_weight = max(int(cfg.get("alg_marker_weight", 10) or 10), 0)
@@ -2197,6 +2198,64 @@ class TextMatcher:
         self.alg_problem_ids = ids
         self._init_interview_hot_library(alg_data)
 
+    def _normalize_hot_problem_entry(self, item: dict) -> dict | None:
+        if not isinstance(item, dict):
+            return None
+
+        title_display = str(item.get("title", "") or "").strip()
+        title = self._normalize_text(title_display)
+        source = str(item.get("source", "") or "").strip()
+        difficulty = str(item.get("difficulty", "") or "").strip()
+        last_date = str(item.get("last_date", "") or "").strip()
+        url = str(item.get("url", item.get("link", "")) or "").strip()
+        frontend_id = str(item.get("frontend_id", item.get("problem_id", "")) or "").strip()
+
+        raw_id = item.get("id")
+        problem_id = None
+        if raw_id is not None and str(raw_id).strip() != "":
+            try:
+                parsed_id = int(raw_id)
+                if 1 <= parsed_id <= 9999:
+                    problem_id = parsed_id
+            except Exception:
+                problem_id = None
+
+        frequency = self._to_non_negative_int(
+            item.get("frequency", item.get("count", item.get("freq", 0))),
+            0,
+        )
+        if frequency <= 0:
+            frequency = 1
+
+        if not title and problem_id is None:
+            return None
+
+        return {
+            "id": problem_id,
+            "frontend_id": frontend_id,
+            "title": title,
+            "title_display": title_display,
+            "frequency": frequency,
+            "source": source,
+            "difficulty": difficulty,
+            "last_date": last_date,
+            "url": url,
+        }
+
+    @staticmethod
+    def _build_hot_entry_payload(entry: dict) -> dict:
+        return {
+            "id": entry.get("id"),
+            "frontend_id": entry.get("frontend_id", ""),
+            "title": entry.get("title", ""),
+            "title_display": entry.get("title_display", ""),
+            "frequency": entry.get("frequency", 1),
+            "source": entry.get("source", ""),
+            "difficulty": entry.get("difficulty", ""),
+            "last_date": entry.get("last_date", ""),
+            "url": entry.get("url", ""),
+        }
+
     def _init_interview_hot_library(self, alg_data: dict):
         entries = alg_data.get("interview_hot_problems", [])
         if not isinstance(entries, list) or not entries:
@@ -2209,50 +2268,16 @@ class TextMatcher:
         id_entry = {}
 
         for item in entries:
-            if not isinstance(item, dict):
+            normalized = self._normalize_hot_problem_entry(item)
+            if not normalized:
                 continue
 
-            title_display = str(item.get("title", "") or "").strip()
-            title = self._normalize_text(title_display)
-            source = str(item.get("source", "") or "").strip()
-            difficulty = str(item.get("difficulty", "") or "").strip()
-            last_date = str(item.get("last_date", "") or "").strip()
-            url = str(item.get("url", item.get("link", "")) or "").strip()
-            frontend_id = str(item.get("frontend_id", item.get("problem_id", "")) or "").strip()
+            normalized_entries.append(normalized)
 
-            raw_id = item.get("id")
-            problem_id = None
-            if raw_id is not None and str(raw_id).strip() != "":
-                try:
-                    parsed_id = int(raw_id)
-                    if 1 <= parsed_id <= 9999:
-                        problem_id = parsed_id
-                except Exception:
-                    problem_id = None
-
-            frequency = self._to_non_negative_int(
-                item.get("frequency", item.get("count", item.get("freq", 0))),
-                0,
-            )
-            if frequency <= 0:
-                frequency = 1
-
-            if not title and problem_id is None:
-                continue
-
-            normalized_entries.append(
-                {
-                    "id": problem_id,
-                    "frontend_id": frontend_id,
-                    "title": title,
-                    "title_display": title_display,
-                    "frequency": frequency,
-                    "source": source,
-                    "difficulty": difficulty,
-                    "last_date": last_date,
-                    "url": url,
-                }
-            )
+            title = normalized.get("title", "")
+            frequency = normalized.get("frequency", 1)
+            problem_id = normalized.get("id")
+            payload = self._build_hot_entry_payload(normalized)
 
             if title:
                 old_freq = title_freq.get(title, 0)
@@ -2260,20 +2285,7 @@ class TextMatcher:
                     title_freq[title] = frequency
 
                 old_entry = title_entry.get(title)
-                title_entry[title] = self._choose_hot_entry(
-                    old_entry,
-                    {
-                        "id": problem_id,
-                        "frontend_id": frontend_id,
-                        "title": title,
-                        "title_display": title_display,
-                        "frequency": frequency,
-                        "source": source,
-                        "difficulty": difficulty,
-                        "last_date": last_date,
-                        "url": url,
-                    },
-                )
+                title_entry[title] = self._choose_hot_entry(old_entry, payload)
 
             if problem_id is not None:
                 old_freq = id_freq.get(problem_id, 0)
@@ -2281,20 +2293,7 @@ class TextMatcher:
                     id_freq[problem_id] = frequency
 
                 old_entry = id_entry.get(problem_id)
-                id_entry[problem_id] = self._choose_hot_entry(
-                    old_entry,
-                    {
-                        "id": problem_id,
-                        "frontend_id": frontend_id,
-                        "title": title,
-                        "title_display": title_display,
-                        "frequency": frequency,
-                        "source": source,
-                        "difficulty": difficulty,
-                        "last_date": last_date,
-                        "url": url,
-                    },
-                )
+                id_entry[problem_id] = self._choose_hot_entry(old_entry, payload)
 
         self.alg_hot_problem_entries = normalized_entries
         self.alg_hot_title_freq = title_freq

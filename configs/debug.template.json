@@ -1,0 +1,17 @@
+{
+    "show_progress_bar":  true,
+    "crawl_debug_log":  false,
+    "company_debug_log":  false,
+    "filtered_posts_log":  false,
+    "filtered_posts_log_limit":  50,
+    "debug_log":  false,
+    "ac_benchmark_log":  {
+                             "enabled":  false,
+                             "print_full_patterns":  false,
+                             "pattern_preview_limit":  30,
+                             "print_full_text_metadata":  false,
+                             "text_sample_count":  5,
+                             "text_sample_chars":  120,
+                             "print_round_timings":  true
+                         }
+}

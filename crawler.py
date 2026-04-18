@@ -1,6 +1,9 @@
-﻿import logging
+﻿import json
+import logging
 import random
+import re
 import time
+import urllib.parse
 
 import requests
 from bs4 import BeautifulSoup
@@ -283,6 +286,150 @@ class NowcoderCrawler:
                 break
         return posts
 
+    def _build_detail_candidates(self, post_id, post_uuid, detail_api_type=None):
+        candidates = []
+        if detail_api_type == "content-data":
+            if post_id is not None:
+                candidates.append(("content-data", str(post_id)))
+            if post_uuid:
+                candidates.append(("moment-data", str(post_uuid)))
+        elif detail_api_type == "moment-data":
+            if post_uuid:
+                candidates.append(("moment-data", str(post_uuid)))
+            if post_id is not None:
+                candidates.append(("content-data", str(post_id)))
+        else:
+            if post_id is not None:
+                candidates.append(("content-data", str(post_id)))
+            if post_uuid:
+                candidates.append(("moment-data", str(post_uuid)))
+
+        return candidates
+
+    def _fetch_content_from_detail_api(self, candidate_details, api_headers):
+        visited = set()
+        for api_type, detail_id in candidate_details:
+            key = (api_type, detail_id)
+            if key in visited:
+                continue
+            visited.add(key)
+
+            try:
+                api_url = f"https://gw-c.nowcoder.com/api/sparta/detail/{api_type}/detail/{detail_id}"
+                api_resp = self.session.get(api_url, headers=api_headers, timeout=self.detail_api_timeout)
+                if api_resp.status_code != 200:
+                    continue
+
+                res_json = api_resp.json()
+                data = res_json.get("data")
+                if isinstance(data, dict) and data.get("content"):
+                    return data.get("content", "")
+            except Exception as e:
+                if self.crawl_debug_log:
+                    logging.debug(f"API detail fallback to next endpoint: {e}")
+
+        return ""
+
+    def _extract_content_from_initial_state(self, page_text: str, post_uuid) -> str:
+        match = re.search(
+            r"window\.__INITIAL_STATE__\s*=\s*(.*?)(?:;\(function|;\s*</script>|</script>)",
+            page_text,
+            flags=re.DOTALL,
+        )
+        if not match:
+            return ""
+
+        try:
+            raw_data = match.group(1).strip(" \t\r\n;")
+            if raw_data.startswith("%7B") or raw_data.startswith("%22"):
+                raw_data = urllib.parse.unquote(raw_data)
+
+            data = json.loads(raw_data)
+            if isinstance(data, str):
+                data = json.loads(data)
+
+            for value in data.get("prefetchData", {}).values():
+                if not isinstance(value, dict) or "ssrCommonData" not in value:
+                    continue
+                ssr_data = value.get("ssrCommonData", {})
+                for data_key in ("contentData", "momentData"):
+                    item_dict = ssr_data.get(data_key)
+                    if isinstance(item_dict, dict) and item_dict.get("content"):
+                        return item_dict.get("content", "")
+        except Exception as e:
+            if self.crawl_debug_log:
+                self._log_warning(f"Failed to parse embedded JSON (UUID: {post_uuid}): {e}")
+
+        return ""
+
+    @staticmethod
+    def _extract_content_from_html(soup: BeautifulSoup) -> str:
+        content_div = (
+            soup.find("div", class_="feed-content-text")
+            or soup.find("div", class_="nc-slate-editor-content")
+            or soup.find("div", class_="nc-post-content")
+            or soup.find("div", class_="post-content")
+            or soup.find("div", class_="feed-content")
+            or soup.find("div", class_="content-box")
+        )
+
+        if not content_div:
+            return ""
+
+        for tag in content_div.find_all(["br", "p", "div"]):
+            tag.insert_after("\n")
+        return content_div.get_text(separator=" ", strip=True)
+
+    @staticmethod
+    def _clean_detail_content(content: str) -> str:
+        return str(content or "").replace("\u200b", "")
+
+    def _archive_limit_reached(self, archived_for_keyword: int) -> bool:
+        return self.max_items > 0 and (not self.fill_valid_quota) and archived_for_keyword >= self.max_items
+
+    def _flush_scoring_buffer(self, scoring_buffer: list, all_data: list, archived_for_keyword: int) -> tuple[int, bool]:
+        if not scoring_buffer:
+            return archived_for_keyword, False
+
+        inputs = [
+            {
+                "title": item.get("title", ""),
+                "content": item.get("content", ""),
+                "tags": item.get("tags", []),
+            }
+            for item in scoring_buffer
+        ]
+        score_reports = self.matcher.evaluate_posts_quality_parallel(inputs)
+
+        reached_limit = False
+        for item, score_report in zip(scoring_buffer, score_reports):
+            if score_report.get("enabled"):
+                item["quality_score"] = score_report.get("score", 0)
+                item["quality_score_breakdown"] = score_report.get("breakdown", {})
+                item["algorithm_matches"] = score_report.get("breakdown", {}).get("alg_hot_matches", [])
+
+                if not score_report.get("passed", True):
+                    self._record_score_filtered_post(item, score_report)
+                    if self.crawl_debug_log:
+                        logging.info(
+                            f"[-] score below threshold ({score_report.get('score', 0)}/"
+                            f"{score_report.get('threshold', self.score_filter_threshold)}), filtered: {item['title']}"
+                        )
+                    continue
+
+            item["comments"] = self.get_comments(item["id"])
+            all_data.append(item)
+            archived_for_keyword += 1
+            if self.crawl_debug_log:
+                logging.info(f"archived: {item['title']}")
+
+            if self._archive_limit_reached(archived_for_keyword):
+                reached_limit = True
+                break
+
+        scoring_buffer.clear()
+        return archived_for_keyword, reached_limit
+
     def get_post_detail(self, post_id, post_uuid, detail_api_type=None):
         canonical_url = f"https://www.nowcoder.com/feed/main/detail/{post_uuid}"
         if detail_api_type == "content-data" and post_id is not None:
@@ -294,103 +441,28 @@ class NowcoderCrawler:
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "application/json, text/plain, */*",
             }
-            content = ""
-
-            candidate_details = []
-            if detail_api_type == "content-data":
-                if post_id is not None:
-                    candidate_details.append(("content-data", str(post_id)))
-                if post_uuid:
-                    candidate_details.append(("moment-data", str(post_uuid)))
-            elif detail_api_type == "moment-data":
-                if post_uuid:
-                    candidate_details.append(("moment-data", str(post_uuid)))
-                if post_id is not None:
-                    candidate_details.append(("content-data", str(post_id)))
-            else:
-                if post_id is not None:
-                    candidate_details.append(("content-data", str(post_id)))
-                if post_uuid:
-                    candidate_details.append(("moment-data", str(post_uuid)))
-
-            visited = set()
-            for api_type, detail_id in candidate_details:
-                key = (api_type, detail_id)
-                if key in visited:
-                    continue
-                visited.add(key)
-
-                try:
-                    api_url = f"https://gw-c.nowcoder.com/api/sparta/detail/{api_type}/detail/{detail_id}"
-                    api_resp = self.session.get(api_url, headers=api_headers, timeout=self.detail_api_timeout)
-                    if api_resp.status_code == 200:
-                        res_json = api_resp.json()
-                        if res_json.get("data") and isinstance(res_json["data"], dict) and res_json["data"].get("content"):
-                            content = res_json["data"]["content"]
-                            break
-                except Exception as e:
-                    if self.crawl_debug_log:
-                        logging.debug(f"API detail fallback to next endpoint: {e}")
+            candidate_details = self._build_detail_candidates(post_id, post_uuid, detail_api_type)
+            content = self._fetch_content_from_detail_api(candidate_details, api_headers)
 
             if content:
-                return {"content": content.replace("\u200b", ""), "tags": [], "url": canonical_url}
+                return {"content": self._clean_detail_content(content), "tags": [], "url": canonical_url}
 
             url = canonical_url
             resp = self.session.get(url, timeout=self.detail_page_timeout)
             if resp.status_code == 200 and not content:
-                import json
-                import re
-                import urllib.parse
-
-                match = re.search(r"window\.__INITIAL_STATE__\s*=\s*(.*?)(?:;\(function|;\s*</script>|</script>)", resp.text, flags=re.DOTALL)
-                if match:
-                    try:
-                        raw_data = match.group(1).strip(" \t\r\n;")
-                        if raw_data.startswith("%7B") or raw_data.startswith("%22"):
-                            raw_data = urllib.parse.unquote(raw_data)
-
-                        data = json.loads(raw_data)
-                        if isinstance(data, str):
-                            data = json.loads(data)
-
-                        for _, v in data.get("prefetchData", {}).items():
-                            if isinstance(v, dict) and "ssrCommonData" in v:
-                                ssr_data = v["ssrCommonData"]
-                                for data_key in ["contentData", "momentData"]:
-                                    if data_key in ssr_data:
-                                        item_dict = ssr_data[data_key]
-                                        if isinstance(item_dict, dict) and item_dict.get("content"):
-                                            content = item_dict["content"]
-                                            break
-                                if content:
-                                    break
-                    except Exception as e:
-                        if self.crawl_debug_log:
-                            self._log_warning(f"Failed to parse embedded JSON (UUID: {post_uuid}): {e}")
+                content = self._extract_content_from_initial_state(resp.text, post_uuid)
 
                 soup = BeautifulSoup(resp.text, "html.parser")
-
                 if not content:
-                    content_div = (
-                        soup.find("div", class_="feed-content-text")
-                        or soup.find("div", class_="nc-slate-editor-content")
-                        or soup.find("div", class_="nc-post-content")
-                        or soup.find("div", class_="post-content")
-                        or soup.find("div", class_="feed-content")
-                        or soup.find("div", class_="content-box")
-                    )
-                    if content_div:
-                        for tag in content_div.find_all(["br", "p", "div"]):
-                            tag.insert_after("\n")
-                        content = content_div.get_text(separator=" ", strip=True)
+                    content = self._extract_content_from_html(soup)
 
                 if content:
-                    content = content.replace("\u200b", "")
+                    content = self._clean_detail_content(content)
 
                 tags = [tag.get_text(strip=True) for tag in soup.find_all("a", class_="discuss-tag-item") if soup]
                 return {"content": content, "tags": tags, "url": url}
             elif content:
-                return {"content": content.replace("\u200b", ""), "tags": [], "url": canonical_url}
+                return {"content": self._clean_detail_content(content), "tags": [], "url": canonical_url}
 
             time.sleep(random.uniform(1.0, 2.0))
         except Exception as e:
@@ -432,51 +504,9 @@ class NowcoderCrawler:
                 handled_candidates = 0
                 scoring_buffer = []
 
-                def flush_scoring_buffer() -> bool:
-                    nonlocal archived_for_keyword
-                    if not scoring_buffer:
-                        return False
-
-                    inputs = [
-                        {
-                            "title": item.get("title", ""),
-                            "content": item.get("content", ""),
-                            "tags": item.get("tags", []),
-                        }
-                        for item in scoring_buffer
-                    ]
-                    score_reports = self.matcher.evaluate_posts_quality_parallel(inputs)
-
-                    reached_limit = False
-                    for item, score_report in zip(scoring_buffer, score_reports):
-                        if score_report.get("enabled"):
-                            item["quality_score"] = score_report.get("score", 0)
-                            item["quality_score_breakdown"] = score_report.get("breakdown", {})
-                            item["algorithm_matches"] = score_report.get("breakdown", {}).get("alg_hot_matches", [])
-                            if not score_report.get("passed", True):
-                                self._record_score_filtered_post(item, score_report)
-                                if self.crawl_debug_log:
-                                    logging.info(
-                                        f"[-] score below threshold ({score_report.get('score', 0)}/{score_report.get('threshold', self.score_filter_threshold)}), filtered: {item['title']}"
-                                    )
-                                continue
-
-                        item["comments"] = self.get_comments(item["id"])
-                        all_data.append(item)
-                        archived_for_keyword += 1
-                        if self.crawl_debug_log:
-                            logging.info(f"archived: {item['title']}")
-
-                        if self.max_items > 0 and (not self.fill_valid_quota) and archived_for_keyword >= self.max_items:
-                            reached_limit = True
-                            break
-
-                    scoring_buffer.clear()
-                    return reached_limit
-
                 reached_quota = False
                 for p in self.iter_search_posts(kw):
-                    if self.max_items > 0 and (not self.fill_valid_quota) and archived_for_keyword >= self.max_items:
+                    if self._archive_limit_reached(archived_for_keyword):
                         break
 
                     handled_candidates += 1
@@ -492,7 +522,11 @@ class NowcoderCrawler:
                         scoring_buffer.append(p)
 
                         if len(scoring_buffer) >= self.score_parallel_batch_size:
-                            reached_quota = flush_scoring_buffer()
+                            archived_for_keyword, reached_quota = self._flush_scoring_buffer(
+                                scoring_buffer,
+                                all_data,
+                                archived_for_keyword,
+                            )
                             if reached_quota:
                                 if self.crawl_debug_log:
                                     logging.info(f"keyword '{kw}' reached archive target {self.max_items}, stop early")
@@ -505,7 +539,11 @@ class NowcoderCrawler:
                         self._render_keyword_status(kw, handled_candidates, archived_for_keyword)
 
                 if not reached_quota:
-                    flush_scoring_buffer()
+                    archived_for_keyword, _ = self._flush_scoring_buffer(
+                        scoring_buffer,
+                        all_data,
+                        archived_for_keyword,
+                    )
 
                 self._ensure_progress_newline()
                 if self.show_progress_bar and not self.crawl_debug_log:

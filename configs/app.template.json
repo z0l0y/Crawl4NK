@@ -1,0 +1,15 @@
+{
+    "cookie":  "请在此处填入你登录牛客网后的 Cookie 字符串",
+    "keywords":  [
+                     "后端 面经"
+                 ],
+    "max_pages":  5,
+    "max_items_per_keyword":  10,
+    "fill_valid_quota":  false,
+    "output_file":  "nowcoder_data",
+    "output_formats":  [
+                           "xlsx",
+                           "md",
+                           "txt"
+                       ]
+}
