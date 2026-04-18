@@ -3,6 +3,7 @@
     "keywords": ["后端 面经"],
     "max_pages": 5,
     "max_items_per_keyword": 10,
+    "fill_valid_quota": false,
     "output_file": "nowcoder_data",
     "output_formats": ["xlsx", "md", "txt"],
     "show_progress_bar": true,
@@ -12,13 +13,126 @@
     "request_read_timeout": 15,
     "request_retry_count": 2,
     "request_retry_backoff": 0.5,
+    "ac_backend": "auto",
+    "ac_native_min_patterns": 64,
+    "ac_benchmark_log": {
+        "enabled": false,
+        "print_full_patterns": false,
+        "pattern_preview_limit": 30,
+        "print_full_text_metadata": false,
+        "text_sample_count": 5,
+        "text_sample_chars": 120,
+        "print_round_timings": true
+    },
     "filtered_posts_log": false,
     "filtered_posts_log_limit": 50,
     "include_id_column": false,
+    "include_algorithm_annotations": true,
     "drop_unknown_company_posts": true,
     "debug_log": false,
     "filter_rules": {
         "must_contain": ["面经", "后端", "面", "实习", "日常", "开发", "研发"],
-        "must_not_contain": ["内推", "引流", "简历", "答疑"]
+        "must_not_contain": ["内推", "引流", "简历", "答疑"],
+        "allow_overrides": [],
+        "normalization": {
+            "enable_nfkc": true,
+            "map_digit_variants": true,
+            "strip_zero_width": true,
+            "collapse_repeats": false,
+            "repeat_threshold": 3
+        },
+        "skip_char_match": {
+            "enabled": false,
+            "max_skips": 2,
+            "allowed_chars": " \t\r\n-_/|,，.。·!！?？:：;；~`'\"()[]{}<>*+&^%$#@"
+        },
+        "force_combine": {
+            "title_force_contains": [],
+            "content_combine_contains": [],
+            "combine_strip_chars": " \t\r\n-_/|,，.。·!！?？:：;；~`'\"()[]{}<>*+&^%$#@"
+        },
+        "pattern_cache": {
+            "enabled": false,
+            "cache_dir": "ENV/.cache/text_matcher",
+            "version": "v1"
+        },
+        "char_id_compression": {
+            "enabled": true,
+            "dictionary_paths": [
+                "dictionaries/common_hanzi_3500.json"
+            ],
+            "transition_strategy": "balanced",
+            "allow_dynamic_extension": true,
+            "use_index_field": true,
+            "debug_log": false
+        },
+        "score_filter": {
+            "enabled": true,
+            "threshold": 90,
+            "base_score": 18,
+            "title_hit_weight": 12,
+            "title_hit_cap": 36,
+            "content_hit_weight": 8,
+            "content_hit_cap": 34,
+            "length_ideal_chars": 2200,
+            "length_min_chars": 240,
+            "length_max_score": 34,
+            "short_content_chars": 420,
+            "short_content_penalty": 18,
+            "default_keyword_weight": 6,
+            "weighted_keyword_max_score": 44,
+            "weighted_keywords": [
+                {"keyword": "mysql", "weight": 12, "scope": "content", "count": "once"},
+                {"keyword": "索引", "weight": 10, "scope": "content", "count": "once"},
+                {"keyword": "缓存", "weight": 10, "scope": "content", "count": "once"},
+                {"keyword": "事务", "weight": 8, "scope": "content", "count": "once"},
+                {"keyword": "并发", "weight": 8, "scope": "content", "count": "once"},
+                {"keyword": "redis", "weight": 8, "scope": "content", "count": "once"},
+                {"keyword": "mq", "weight": 7, "scope": "content", "count": "once"}
+            ],
+            "tail_scan_chars": 260,
+            "tail_tag_penalty": 3,
+            "tail_tag_penalty_cap": 24,
+            "default_tail_drain_penalty": 6,
+            "tail_drain_penalty_cap": 30,
+            "tail_drain_words": {
+                "内推": 15,
+                "简历": 12,
+                "互助": 8,
+                "咨询": 8,
+                "联系": 8,
+                "关注": 8,
+                "微信": 20,
+                "vx": 18,
+                "面试": 3,
+                "校招": 3,
+                "秋招": 3,
+                "春招": 3,
+                "实习": 2
+            },
+            "alg_enabled": true,
+            "alg_path": "alg.json",
+            "alg_total_cap": 60,
+            "alg_marker_weight": 10,
+            "alg_marker_cap": 20,
+            "alg_topic_weight": 4,
+            "alg_topic_cap": 24,
+            "alg_problem_weight": 7,
+            "alg_problem_cap": 42,
+            "alg_problem_id_weight": 6,
+            "alg_problem_id_cap": 24,
+            "alg_hot_enabled": true,
+            "alg_hot_total_cap": 48,
+            "alg_hot_title_cap": 30,
+            "alg_hot_id_cap": 26,
+            "alg_hot_freq_scale": 3.6,
+            "alg_hot_log_base": 10,
+            "alg_hot_max_per_problem": 12,
+            "parallel_enabled": true,
+            "parallel_workers": 4,
+            "parallel_batch_size": 8,
+            "async_build": true,
+            "debug_log": false
+        }
     }
 }

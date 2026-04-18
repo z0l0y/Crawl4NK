@@ -13,12 +13,14 @@ class DataProcessor:
         self.company_debug_log = bool(self.config.get("company_debug_log", False))
         self.show_progress_bar = bool(self.config.get("show_progress_bar", True))
         self.include_id_column = bool(self.config.get("include_id_column", False))
+        self.include_algorithm_annotations = bool(self.config.get("include_algorithm_annotations", True))
         self.drop_unknown_company_posts = bool(self.config.get("drop_unknown_company_posts", True))
         self.filtered_posts_log = bool(self.config.get("filtered_posts_log", False))
         self.filtered_posts_log_limit = int(self.config.get("filtered_posts_log_limit", 50) or 50)
         self.max_items_per_keyword = int(self.config.get("max_items_per_keyword", 0) or 0)
         self.dropped_unknown_company_count = 0
         self.dropped_unknown_company_examples = []
+        self.unknown_company_fallback_used_count = 0
         
         self.companies = set()
         try:
@@ -420,18 +422,82 @@ class DataProcessor:
         self._company_log(f"[DataProcessor] 提取到的公司名称为: '{best_company}'")
         return best_company
 
+    def _format_algorithm_annotations(self, matches) -> str:
+        if not isinstance(matches, list) or not matches:
+            return ""
+
+        lines = []
+        for item in matches[:20]:
+            if not isinstance(item, dict):
+                continue
+
+            title = str(item.get("title", "") or "").strip()
+            if not title:
+                continue
+
+            problem_id = item.get("id")
+            frontend_id = str(item.get("frontend_id", "") or "").strip()
+            if problem_id is not None:
+                try:
+                    prefix = str(int(problem_id))
+                except Exception:
+                    prefix = str(problem_id)
+            elif frontend_id:
+                prefix = frontend_id
+            else:
+                prefix = ""
+
+            title_part = f"{prefix}. {title}" if prefix else title
+
+            meta_parts = []
+            frequency = item.get("frequency")
+            if frequency is not None:
+                try:
+                    freq_num = int(frequency)
+                except Exception:
+                    freq_num = None
+                if freq_num is not None and freq_num > 0:
+                    meta_parts.append(f"频度:{freq_num}")
+
+            difficulty = str(item.get("difficulty", "") or "").strip()
+            if difficulty:
+                meta_parts.append(f"难度:{difficulty}")
+
+            line = title_part
+            if meta_parts:
+                line += " | " + " | ".join(meta_parts)
+
+            url = str(item.get("url", item.get("link", "")) or "").strip()
+            if url:
+                line += f" | 链接:{url}"
+
+            lines.append(line)
+
+        return "\n".join(lines)
+
     def process(self):
         cleaned_data = []
         self.dropped_unknown_company_count = 0
         self.dropped_unknown_company_examples = []
+        self.unknown_company_fallback_used_count = 0
         kept_keyword_counter = {}
+        keyword_seen_order = []
+        keyword_seen_set = set()
+        unknown_pool_records = {}
+        unknown_pool_examples = {}
         expected_columns = ["标题", "公司", "搜索关键词", "帖子链接", "正文", "评论及回复"]
+        if self.include_algorithm_annotations:
+            expected_columns.append("算法标注")
         if self.include_id_column:
             expected_columns = ["ID"] + expected_columns
 
         total_items = len(self.data)
         for idx, item in enumerate(self.data, start=1):
             keyword = item.get("keyword", "")
+            if keyword and keyword not in keyword_seen_set:
+                keyword_seen_set.add(keyword)
+                keyword_seen_order.append(keyword)
+
             if self.max_items_per_keyword > 0 and keyword:
                 if kept_keyword_counter.get(keyword, 0) >= self.max_items_per_keyword:
                     if self.show_progress_bar and not self.company_debug_log:
@@ -451,16 +517,6 @@ class DataProcessor:
             comments = re.sub(r'\n{3,}', '\n\n', comments)
 
             company = self._extract_company(title, content)
-            if self.drop_unknown_company_posts and company == "其他":
-                self.dropped_unknown_company_count += 1
-                self.dropped_unknown_company_examples.append({
-                    "title": title,
-                    "keyword": keyword,
-                    "url": item.get("url", "")
-                })
-                if self.show_progress_bar and not self.company_debug_log:
-                    self._render_progress(idx, total_items, "清洗打标进度")
-                continue
 
             record = {
                 "标题": title,
@@ -470,8 +526,28 @@ class DataProcessor:
                 "正文": content,
                 "评论及回复": comments
             }
+            if self.include_algorithm_annotations:
+                record["算法标注"] = self._format_algorithm_annotations(item.get("algorithm_matches", []))
             if self.include_id_column:
                 record = {"ID": item.get("id"), **record}
+
+            if self.drop_unknown_company_posts and company == "其他":
+                unknown_example = {
+                    "title": title,
+                    "keyword": keyword,
+                    "url": item.get("url", "")
+                }
+
+                if keyword:
+                    unknown_pool_records.setdefault(keyword, []).append(record)
+                    unknown_pool_examples.setdefault(keyword, []).append(unknown_example)
+                else:
+                    self.dropped_unknown_company_count += 1
+                    self.dropped_unknown_company_examples.append(unknown_example)
+
+                if self.show_progress_bar and not self.company_debug_log:
+                    self._render_progress(idx, total_items, "清洗打标进度")
+                continue
 
             cleaned_data.append(record)
             if keyword:
@@ -479,6 +555,34 @@ class DataProcessor:
 
             if self.show_progress_bar and not self.company_debug_log:
                 self._render_progress(idx, total_items, "清洗打标进度")
+
+        if self.drop_unknown_company_posts:
+            if self.max_items_per_keyword > 0:
+                for keyword in keyword_seen_order:
+                    unknown_records = unknown_pool_records.get(keyword, [])
+                    unknown_examples = unknown_pool_examples.get(keyword, [])
+                    if not unknown_records:
+                        continue
+
+                    current = kept_keyword_counter.get(keyword, 0)
+                    need = max(self.max_items_per_keyword - current, 0)
+                    use_count = min(need, len(unknown_records))
+
+                    if use_count > 0:
+                        cleaned_data.extend(unknown_records[:use_count])
+                        kept_keyword_counter[keyword] = current + use_count
+                        self.unknown_company_fallback_used_count += use_count
+
+                    remaining_examples = unknown_examples[use_count:]
+                    if remaining_examples:
+                        self.dropped_unknown_company_count += len(remaining_examples)
+                        self.dropped_unknown_company_examples.extend(remaining_examples)
+            else:
+                for keyword in keyword_seen_order:
+                    unknown_examples = unknown_pool_examples.get(keyword, [])
+                    if unknown_examples:
+                        self.dropped_unknown_company_count += len(unknown_examples)
+                        self.dropped_unknown_company_examples.extend(unknown_examples)
 
         df = pd.DataFrame(cleaned_data, columns=expected_columns)
         return df
@@ -537,6 +641,7 @@ class DataProcessor:
                     '帖子链接': 45,
                     '正文': 80,
                     '评论及回复': 80,
+                    '算法标注': 90,
                 }
 
                 for col_idx, col_name in enumerate(df.columns):
@@ -546,7 +651,7 @@ class DataProcessor:
 
                     if col_name == '标题':
                         worksheet.set_column(col_range, width, title_format)
-                    elif col_name in ('正文', '评论及回复'):
+                    elif col_name in ('正文', '评论及回复', '算法标注'):
                         worksheet.set_column(col_range, width, wrap_format)
                     else:
                         worksheet.set_column(col_range, width)
@@ -574,11 +679,14 @@ class DataProcessor:
                     url = row.get('帖子链接', '无链接')
                     content = self._sanitize_markdown_text(row.get('正文', '无内容'))
                     comments = self._sanitize_markdown_text(row.get('评论及回复', ''))
+                    algorithm_notes = self._sanitize_markdown_text(row.get('算法标注', ''))
 
                     f.write(f"## {title}\n\n")
                     f.write(f"- **公司/标签**: `{company}`\n")
                     f.write(f"- **链接**: {url}\n\n")
                     f.write(f"### 正文\n\n{content}\n\n")
+                    if algorithm_notes and str(algorithm_notes).strip():
+                        f.write(f"### 算法标注\n\n{algorithm_notes}\n\n")
                     if comments and str(comments).strip():
                         f.write(f"### 评论摘录\n\n{comments}\n\n")
                     f.write("---\n\n")
@@ -601,11 +709,14 @@ class DataProcessor:
                     url = row.get('帖子链接', '无链接')
                     content = row.get('正文', '无内容')
                     comments = row.get('评论及回复', '')
+                    algorithm_notes = row.get('算法标注', '')
 
                     f.write(f"【标题】 {title}\n")
                     f.write(f"【公司】 {company}\n")
                     f.write(f"【链接】 {url}\n")
                     f.write(f"【正文】\n{content}\n")
+                    if algorithm_notes and str(algorithm_notes).strip():
+                        f.write(f"\n【算法标注】\n{algorithm_notes}\n")
                     if comments and str(comments).strip():
                         f.write(f"\n【评论】\n{comments}\n")
                     f.write("\n" + "="*80 + "\n\n")
@@ -618,6 +729,9 @@ class DataProcessor:
     def display_stats(self, df: pd.DataFrame):
         print("\n--- 爬取数据总况 ---")
         print(f"总计爬取帖子数量: {len(df)}")
+
+        if self.drop_unknown_company_posts and self.unknown_company_fallback_used_count > 0:
+            print(f"为补齐每关键词配额，已回补未识别公司帖子: {self.unknown_company_fallback_used_count} 篇")
 
         if self.drop_unknown_company_posts and self.dropped_unknown_company_count > 0:
             print(f"已过滤未识别公司帖子: {self.dropped_unknown_company_count} 篇")
