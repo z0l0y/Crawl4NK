@@ -55,6 +55,16 @@ class NowcoderCrawler:
         self.search_page_strategy = str(config.get("search_page_strategy", "bfs") or "bfs").strip().lower()
         if self.search_page_strategy not in SearchPageScheduler.SUPPORTED_STRATEGIES:
             self.search_page_strategy = "bfs"
+        try:
+            best_first_frontload = int(config.get("best_first_frontload_pages", 3) or 3)
+        except Exception:
+            best_first_frontload = 3
+        try:
+            best_first_explore_stride = int(config.get("best_first_explore_stride", 5) or 5)
+        except Exception:
+            best_first_explore_stride = 5
+        self.best_first_frontload_pages = max(best_first_frontload, 1)
+        self.best_first_explore_stride = max(best_first_explore_stride, 2)
         self.filter_rules = config.get("filter_rules", {})
         self.score_filter_cfg = self.filter_rules.get("score_filter", {})
         self.ac_backend = str(config.get("ac_backend", "auto") or "auto").strip().lower()
@@ -318,12 +328,29 @@ class NowcoderCrawler:
 
     def get_metrics_snapshot(self) -> dict:
         snapshot = dict(self._metrics)
-        search_requests = max(int(snapshot.get("search_requests", 0) or 0), 1)
-        detail_attempts = int(snapshot.get("detail_api_requests", 0) or 0) + int(
+        search_requests_raw = int(snapshot.get("search_requests", 0) or 0)
+        search_requests = max(search_requests_raw, 1)
+        detail_attempts_raw = int(snapshot.get("detail_api_requests", 0) or 0) + int(
             snapshot.get("detail_page_requests", 0) or 0
         )
-        detail_attempts = max(detail_attempts, 1)
-        comment_requests = max(int(snapshot.get("comment_requests", 0) or 0), 1)
+        detail_attempts = max(detail_attempts_raw, 1)
+        comment_requests_raw = int(snapshot.get("comment_requests", 0) or 0)
+        comment_requests = max(comment_requests_raw, 1)
+        candidate_seen = int(snapshot.get("candidate_seen", 0) or 0)
+        archived_items = int(snapshot.get("archived_items", 0) or 0)
+
+        detail_api_requests_raw = int(snapshot.get("detail_api_requests", 0) or 0)
+        detail_api_requests = max(detail_api_requests_raw, 1)
+        detail_page_requests_raw = int(snapshot.get("detail_page_requests", 0) or 0)
+        detail_page_requests = max(detail_page_requests_raw, 1)
+
+        search_elapsed = max(float(self._timing_totals.get("search_api", 0.0) or 0.0), 1e-9)
+        detail_elapsed = max(float(self._timing_totals.get("detail_fetch", 0.0) or 0.0), 1e-9)
+        comment_elapsed = max(float(self._timing_totals.get("comment_fetch", 0.0) or 0.0), 1e-9)
+
+        crawl_elapsed = 0.0
+        if self._timing_live_started_at > 0:
+            crawl_elapsed = max(time.perf_counter() - self._timing_live_started_at, 0.0)
 
         snapshot["search_success_rate"] = round(
             (int(snapshot.get("search_success", 0) or 0) / float(search_requests)) * 100.0,
@@ -342,6 +369,19 @@ class NowcoderCrawler:
             (int(snapshot.get("comment_success", 0) or 0) / float(comment_requests)) * 100.0,
             2,
         )
+        snapshot["detail_api_hit_rate"] = round(
+            (int(snapshot.get("detail_api_success", 0) or 0) / float(detail_api_requests)) * 100.0,
+            2,
+        )
+        snapshot["detail_page_hit_rate"] = round(
+            (int(snapshot.get("detail_page_success", 0) or 0) / float(detail_page_requests)) * 100.0,
+            2,
+        )
+        snapshot["search_qps"] = round(search_requests_raw / search_elapsed, 2)
+        snapshot["detail_qps"] = round(detail_attempts_raw / detail_elapsed, 2)
+        snapshot["comment_qps"] = round(comment_requests_raw / comment_elapsed, 2)
+        snapshot["archive_yield_rate"] = round((archived_items / float(max(candidate_seen, 1))) * 100.0, 2)
+        snapshot["crawl_elapsed_sec"] = round(crawl_elapsed, 3)
         snapshot["timing_totals"] = dict(self._timing_totals)
         snapshot["timing_counts"] = dict(self._timing_counts)
         return snapshot
@@ -634,7 +674,12 @@ class NowcoderCrawler:
         url = "https://gw-c.nowcoder.com/api/sparta/pc/search"
         seen_posts = set()
         page_limit = self._effective_page_limit()
-        page_scheduler = SearchPageScheduler(page_limit=page_limit, strategy=self.search_page_strategy)
+        page_scheduler = SearchPageScheduler(
+            page_limit=page_limit,
+            strategy=self.search_page_strategy,
+            best_first_frontload=self.best_first_frontload_pages,
+            best_first_explore_stride=self.best_first_explore_stride,
+        )
         empty_page_streak = 0
         scanned_pages = 0
         stop_reason = "running"

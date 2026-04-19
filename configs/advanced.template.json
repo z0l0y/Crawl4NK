@@ -38,6 +38,8 @@
     "request_retry_count":  2,
     "request_retry_backoff":  0.5,
     "search_page_strategy":  "bfs",
+    "best_first_frontload_pages":  3,
+    "best_first_explore_stride":  5,
     "streaming_process_enabled":  true,
     "streaming_queue_size":  64,
     "metrics_summary_log":  true,

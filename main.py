@@ -109,7 +109,21 @@ def print_runtime_summary(config: Dict, loaded_files: List[str], keywords: List[
     else:
         print("采集模式 -> 归档配额优先 (达到 max_items_per_keyword 后提前停止)")
     print("页数策略 -> fill_valid_quota=false 时严格按 max_pages；fill_valid_quota=true 时允许动态扩页(受 max_pages_hard_limit 限制)")
-    print(f"搜索调度策略 -> {str(config.get('search_page_strategy', 'bfs') or 'bfs').lower()}")
+    search_strategy = str(config.get("search_page_strategy", "bfs") or "bfs").lower()
+    print(f"搜索调度策略 -> {search_strategy}")
+    if search_strategy == "best_first":
+        try:
+            frontload_pages = int(config.get("best_first_frontload_pages", 3) or 3)
+        except Exception:
+            frontload_pages = 3
+        try:
+            explore_stride = int(config.get("best_first_explore_stride", 5) or 5)
+        except Exception:
+            explore_stride = 5
+        print(
+            f"best_first参数 -> frontload_pages={max(frontload_pages, 1)}, "
+            f"explore_stride={max(explore_stride, 2)}"
+        )
     print(f"流式处理 -> {bool(config.get('streaming_process_enabled', True))}")
     if bool(config.get("proxy_rotation_enabled", False)):
         print(f"代理轮换 -> 开启 (proxy_pool 数量: {len(config.get('proxy_pool', []) or [])})")
@@ -306,25 +320,32 @@ def print_crawl_metrics(crawler: NowcoderCrawler, enabled: bool = True):
         "  "
         f"search_req={metrics.get('search_requests', 0)} "
         f"search_ok={metrics.get('search_success', 0)} "
-        f"search_rate={metrics.get('search_success_rate', 0)}%"
+        f"search_rate={metrics.get('search_success_rate', 0)}% "
+        f"search_qps={metrics.get('search_qps', 0)}/s"
     )
     print(
         "  "
         f"detail_api={metrics.get('detail_api_requests', 0)} "
         f"detail_page={metrics.get('detail_page_requests', 0)} "
-        f"detail_rate={metrics.get('detail_success_rate', 0)}%"
+        f"detail_rate={metrics.get('detail_success_rate', 0)}% "
+        f"detail_qps={metrics.get('detail_qps', 0)}/s "
+        f"api_hit={metrics.get('detail_api_hit_rate', 0)}% "
+        f"page_hit={metrics.get('detail_page_hit_rate', 0)}%"
     )
     print(
         "  "
         f"comments_req={metrics.get('comment_requests', 0)} "
         f"comments_rate={metrics.get('comment_success_rate', 0)}% "
+        f"comment_qps={metrics.get('comment_qps', 0)}/s "
         f"timeouts={metrics.get('network_timeout', 0)} "
         f"errors={metrics.get('network_error', 0)}"
     )
     print(
         "  "
         f"candidates={metrics.get('candidate_seen', 0)} "
-        f"archived={metrics.get('archived_items', 0)}"
+        f"archived={metrics.get('archived_items', 0)} "
+        f"archive_yield={metrics.get('archive_yield_rate', 0)}% "
+        f"elapsed={metrics.get('crawl_elapsed_sec', 0)}s"
     )
 
 
@@ -404,7 +425,7 @@ def main():
                 print("未抓取到任何符合要求的数据！请检查配置文件的关键词与过滤规则，或检查网络和 Cookie。")
             return
 
-        print(f"流式抓取完成，共处理 {processor.last_processed_input_count} 篇候选帖子。")
+        print(f"流式抓取完成，共处理 {processor.last_processed_input_count} 篇归档帖子。")
     else:
         crawl_start = time.perf_counter()
         raw_data = crawler.crawl()
@@ -427,7 +448,7 @@ def main():
                 print("未抓取到任何符合要求的数据！请检查配置文件的关键词与过滤规则，或检查网络和 Cookie。")
             return
 
-        print(f"抓取完成，共获取 {len(raw_data)} 篇候选帖子。开始进行清洗和智能打标...")
+        print(f"抓取完成，共获取 {len(raw_data)} 篇归档帖子。开始进行清洗和智能打标...")
 
         process_start = time.perf_counter()
         processor = run_with_spinner(
