@@ -13,7 +13,7 @@
     "include_comments_column":  false,
     "company_must_in_list":  true,
     "streaming_process_enabled":  true,
-    "metrics_summary_log":  true,
+    "metrics_summary_log":  false,
     "output_file":  "nowcoder_data",
     "output_formats":  [
                            "xlsx",

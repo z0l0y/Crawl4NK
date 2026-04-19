@@ -400,7 +400,7 @@ class NowcoderCrawler:
         self._progress_active = True
 
     def _record_timing(self, stage: str, elapsed: float):
-        if (not self.timing_profile_log) or stage not in self._timing_totals:
+        if stage not in self._timing_totals:
             return
         try:
             delta = float(elapsed)
@@ -411,7 +411,8 @@ class NowcoderCrawler:
 
         self._timing_totals[stage] += delta
         self._timing_counts[stage] = self._timing_counts.get(stage, 0) + 1
-        self._render_timing_live()
+        if self.timing_profile_log:
+            self._render_timing_live()
 
     def _snapshot_timing(self) -> tuple[dict, dict]:
         return dict(self._timing_totals), dict(self._timing_counts)
