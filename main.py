@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List
 
 from config_loader import load_config
@@ -71,13 +72,20 @@ def apply_cli_overrides(config: Dict, args: argparse.Namespace) -> Dict:
     return config
 
 
-def build_output_filename_base(base_output: str, max_pages: int, max_items: int) -> str:
-    base_name, ext = os.path.splitext(base_output)
-    if not ext:
-        ext = ".xlsx"
-
+def build_output_file_stem(base_output: str, max_pages: int, max_items: int) -> str:
+    base_name = Path(str(base_output or "nowcoder_data")).stem or "nowcoder_data"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"{base_name}_p{max_pages}_i{max_items}_{timestamp}"
+
+
+def build_output_paths(file_stem: str) -> Dict[str, str]:
+    now = datetime.now()
+    date_root = Path("docs") / now.strftime("%Y") / now.strftime("%m") / now.strftime("%d")
+    return {
+        "xlsx": str(date_root / "xlsx" / f"{file_stem}.xlsx"),
+        "md": str(date_root / "md" / f"{file_stem}.md"),
+        "txt": str(date_root / "txt" / f"{file_stem}.txt"),
+    }
 
 
 def print_runtime_summary(config: Dict, loaded_files: List[str], keywords: List[str], max_pages: int, max_items: int):
@@ -247,15 +255,24 @@ def print_filtered_score_details(crawler: NowcoderCrawler, config: Dict):
             print(f"      链接: {item.get('url')}")
 
 
-def export_outputs(processor: DataProcessor, df, output_filename_base: str, formats: List[str]):
+def export_outputs(processor: DataProcessor, df, output_paths: Dict[str, str], formats: List[str]):
     lowered = {str(fmt).lower() for fmt in (formats or [])}
 
     if "xlsx" in lowered or "excel" in lowered:
-        processor.save_to_excel(df, f"{output_filename_base}.xlsx")
+        xlsx_path = output_paths.get("xlsx", "")
+        if xlsx_path:
+            Path(xlsx_path).parent.mkdir(parents=True, exist_ok=True)
+            processor.save_to_excel(df, xlsx_path)
     if "md" in lowered or "markdown" in lowered:
-        processor.save_to_markdown(df, f"{output_filename_base}.md")
+        md_path = output_paths.get("md", "")
+        if md_path:
+            Path(md_path).parent.mkdir(parents=True, exist_ok=True)
+            processor.save_to_markdown(df, md_path)
     if "txt" in lowered or "text" in lowered:
-        processor.save_to_txt(df, f"{output_filename_base}.txt")
+        txt_path = output_paths.get("txt", "")
+        if txt_path:
+            Path(txt_path).parent.mkdir(parents=True, exist_ok=True)
+            processor.save_to_txt(df, txt_path)
 
 
 def print_pipeline_timing(enabled: bool, stage_costs: Dict[str, float]):
@@ -277,7 +294,8 @@ def main():
     max_pages = int(config.get("max_pages", 5) or 5)
     max_items = int(config.get("max_items_per_keyword", 10) or 10)
     base_output = str(config.get("output_file", "nowcoder_data") or "nowcoder_data")
-    output_filename_base = build_output_filename_base(base_output, max_pages, max_items)
+    output_file_stem = build_output_file_stem(base_output, max_pages, max_items)
+    output_paths = build_output_paths(output_file_stem)
     formats = config.get("output_formats", ["xlsx"])
     runtime_summary_log = bool(config.get("runtime_summary_log", False))
     timing_profile_log = bool(config.get("timing_profile_log", False))
@@ -355,7 +373,7 @@ def main():
     export_start = time.perf_counter()
     run_with_spinner(
         "导出文件",
-        lambda: export_outputs(processor, df, output_filename_base, formats),
+        lambda: export_outputs(processor, df, output_paths, formats),
         enabled=stage_spinner_enabled and (not bool(config.get("show_progress_bar", True))),
         interval_sec=stage_spinner_interval_sec,
     )

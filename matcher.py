@@ -938,7 +938,7 @@ class WeightedScoringAutomaton:
 
 class TextMatcher:
     _DEFAULT_SKIP_ALLOWED_CHARS = " \t\r\n-_/|,，.。·!！?？:：;；~`'\"()[]{}<>*+&^%$#@"
-    _DEFAULT_CACHE_DIR = os.path.join("ENV", ".cache", "text_matcher")
+    _DEFAULT_CACHE_DIR = os.path.join("env", ".cache", "text_matcher")
     _DEFAULT_AUTOMATON_CACHE_DIR = os.path.join(_DEFAULT_CACHE_DIR, "automata")
     _DEFAULT_CHAR_ID_DICT_PATHS = [
         os.path.join("dictionaries", "common_hanzi_3500.json"),
@@ -1007,6 +1007,21 @@ class TextMatcher:
         "算法题",
         "刷题",
         "题解",
+        "coding interview",
+    ]
+    _DEFAULT_ALG_CONTEXT_PREFIX_KEYWORDS = [
+        "算法",
+        "算法题",
+        "手撕",
+        "手写",
+        "力扣",
+        "leetcode",
+        "lc",
+        "刷题",
+        "题解",
+        "编程题",
+        "hot100",
+        "hot 100",
         "coding interview",
     ]
     _HTML_BREAK_TAG_RE = re.compile(r"<\s*(?:br|/p|/div|/li|/tr|/h[1-6]|/blockquote)\b[^>]*>", re.IGNORECASE)
@@ -2024,6 +2039,13 @@ class TextMatcher:
         if not os.path.isabs(self.score_alg_path):
             self.score_alg_path = os.path.join(os.path.dirname(__file__), self.score_alg_path)
 
+        self.score_alg_context_required = bool(cfg.get("alg_context_required", True))
+        self.score_alg_context_prefix_chars = max(int(cfg.get("alg_context_prefix_chars", 24) or 24), 0)
+        self.score_alg_context_prefix_keywords = self._normalize_unique_strings(
+            cfg.get("alg_context_prefix_keywords", self._DEFAULT_ALG_CONTEXT_PREFIX_KEYWORDS),
+            min_len=1,
+        )
+
         self.score_alg_total_cap = max(int(cfg.get("alg_total_cap", 60) or 60), 0)
         self.score_alg_marker_weight = max(int(cfg.get("alg_marker_weight", 10) or 10), 0)
         self.score_alg_marker_cap = max(int(cfg.get("alg_marker_cap", 20) or 20), 0)
@@ -2271,6 +2293,53 @@ class TextMatcher:
         score = int(round(raw))
         score = max(score, 1)
         return min(score, self.score_alg_hot_max_per_problem)
+
+    def _is_alg_title_hit_with_context(self, normalized_text: str, normalized_title: str) -> bool:
+        if not normalized_text or not normalized_title:
+            return False
+        if not self.score_alg_context_required:
+            return True
+
+        prefix_chars = max(int(self.score_alg_context_prefix_chars or 0), 0)
+        prefix_keywords = self.score_alg_context_prefix_keywords or []
+        if prefix_chars <= 0 or not prefix_keywords:
+            return True
+
+        pattern = re.escape(normalized_title)
+        for match in re.finditer(pattern, normalized_text):
+            prefix_start = max(match.start() - prefix_chars, 0)
+            prefix_text = normalized_text[prefix_start:match.start()]
+            if any(keyword and keyword in prefix_text for keyword in prefix_keywords):
+                return True
+
+        return False
+
+    def _filter_alg_title_hits_by_context(self, normalized_text: str, hits) -> list:
+        normalized_hits = self._normalize_unique_strings(hits or [], min_len=2)
+        if not normalized_hits:
+            return []
+        if not self.score_alg_context_required:
+            return sorted(normalized_hits)
+
+        kept = []
+        for title in normalized_hits:
+            if self._is_alg_title_hit_with_context(normalized_text, title):
+                kept.append(title)
+        return sorted(kept)
+
+    def _prefer_longest_title_hits(self, hits) -> list:
+        normalized_hits = self._normalize_unique_strings(hits or [], min_len=2)
+        if len(normalized_hits) <= 1:
+            return normalized_hits
+
+        sorted_hits = sorted(normalized_hits, key=lambda item: (-len(item), item))
+        kept_hits = []
+        for token in sorted_hits:
+            if any(token != existing and token in existing for existing in kept_hits):
+                continue
+            kept_hits.append(token)
+
+        return sorted(kept_hits)
 
     def _choose_hot_entry(self, old_entry: dict | None, new_entry: dict) -> dict:
         if not old_entry:
@@ -2662,6 +2731,11 @@ class TextMatcher:
         raw_text = "\n".join([str(raw_title or ""), str(raw_content or "")])
         problem_id_hits = self._extract_alg_problem_ids(raw_text)
 
+        problem_hits = self._filter_alg_title_hits_by_context(merged_text, problem_hits)
+        hot_title_hits = self._filter_alg_title_hits_by_context(merged_text, hot_title_hits)
+        problem_hits = self._prefer_longest_title_hits(problem_hits)
+        hot_title_hits = self._prefer_longest_title_hits(hot_title_hits)
+
         marker_score = min(len(marker_hits) * self.score_alg_marker_weight, self.score_alg_marker_cap)
         topic_score = min(len(topic_hits) * self.score_alg_topic_weight, self.score_alg_topic_cap)
         problem_score = min(len(problem_hits) * self.score_alg_problem_weight, self.score_alg_problem_cap)
@@ -2684,7 +2758,7 @@ class TextMatcher:
                 hot_id_score_raw += self._score_from_hot_frequency(self.alg_hot_id_freq.get(problem_id, 0))
             hot_id_score = min(hot_id_score_raw, self.score_alg_hot_id_cap)
 
-            hot_matches = self._build_hot_match_details(sorted(hot_title_hits), hot_id_hits)
+            hot_matches = self._build_hot_match_details(hot_title_hits, hot_id_hits)
 
         hot_score = hot_title_score + hot_id_score
         if self.score_alg_hot_total_cap > 0:
@@ -2698,12 +2772,12 @@ class TextMatcher:
             "score": int(score),
             "marker_hits": sorted(marker_hits),
             "topic_hits": sorted(topic_hits),
-            "problem_hits": sorted(problem_hits),
+            "problem_hits": problem_hits,
             "problem_id_hits": sorted(problem_id_hits),
             "hot_score": int(hot_score),
             "hot_title_score": int(hot_title_score),
             "hot_id_score": int(hot_id_score),
-            "hot_title_hits": sorted(hot_title_hits),
+            "hot_title_hits": hot_title_hits,
             "hot_id_hits": hot_id_hits,
             "hot_matches": hot_matches,
             "marker_score": int(marker_score),
@@ -2995,7 +3069,7 @@ class TextMatcher:
             r"(?:第\s*|题号\s*[:：]?\s*)(\d{1,4})\s*题?",
             r"(?<!\d)(\d{1,4})\s*题(?!\d)",
             r"(?:算法题|leetcode题|力扣题)\s*[:：]?\s*(\d{1,4})(?=\s|$|[\.．、\)]|[，。；;,:：!！?？#])",
-            r"(?:lc|leetcode|力扣)\s*[-#]?\s*(\d{1,4})",
+            r"(?:lc|leetcode|力扣)\s*[-#：: ]\s*(\d{1,4})",
         ]
 
         for pattern in explicit_id_patterns:
@@ -3006,14 +3080,6 @@ class TextMatcher:
                     continue
                 if value in self.alg_problem_ids:
                     hits.add(value)
-
-        for match in re.finditer(r"(?<!\d)(\d{1,4})(?!\s*[\.．]\s*\d)(?=\s|$|[，。；;,:：!！?？#])", text):
-            try:
-                value = int(match.group(1))
-            except Exception:
-                continue
-            if value in self.alg_problem_ids:
-                hits.add(value)
 
         return hits
 
@@ -3061,6 +3127,9 @@ class TextMatcher:
         raw_text = "\n".join([str(raw_title or ""), str(raw_content or "")])
         problem_id_hits = self._extract_alg_problem_ids(raw_text)
 
+        problem_hits = self._filter_alg_title_hits_by_context(merged_text, problem_hits)
+        problem_hits = self._prefer_longest_title_hits(problem_hits)
+
         marker_score = min(len(marker_hits) * self.score_alg_marker_weight, self.score_alg_marker_cap)
         topic_score = min(len(topic_hits) * self.score_alg_topic_weight, self.score_alg_topic_cap)
         problem_score = min(len(problem_hits) * self.score_alg_problem_weight, self.score_alg_problem_cap)
@@ -3075,7 +3144,8 @@ class TextMatcher:
 
         if self.score_alg_hot_enabled and self.alg_hot_problem_entries:
             hot_title_hits_set = self._search_with_matcher(self.alg_hot_title_matcher, merged_text)
-            hot_title_hits = sorted(hot_title_hits_set)
+            hot_title_hits_set = self._filter_alg_title_hits_by_context(merged_text, hot_title_hits_set)
+            hot_title_hits = self._prefer_longest_title_hits(hot_title_hits_set)
             hot_title_score_raw = 0
             for title in hot_title_hits:
                 hot_title_score_raw += self._score_from_hot_frequency(self.alg_hot_title_freq.get(title, 0))
@@ -3102,7 +3172,7 @@ class TextMatcher:
             "score": int(score),
             "marker_hits": sorted(marker_hits),
             "topic_hits": sorted(topic_hits),
-            "problem_hits": sorted(problem_hits),
+            "problem_hits": problem_hits,
             "problem_id_hits": sorted(problem_id_hits),
             "hot_score": int(hot_score),
             "hot_title_score": int(hot_title_score),

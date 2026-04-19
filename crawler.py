@@ -19,6 +19,29 @@ from matcher import TextMatcher
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
+def _configure_retry_log_handler():
+    retry_logger_names = (
+        "urllib3.connectionpool",
+        "urllib3.util.retry",
+        "requests.packages.urllib3.connectionpool",
+        "requests.packages.urllib3.util.retry",
+    )
+    for logger_name in retry_logger_names:
+        logger = logging.getLogger(logger_name)
+        if any(getattr(handler, "_crawl4nk_newline", False) for handler in logger.handlers):
+            continue
+
+        handler = logging.StreamHandler()
+        handler._crawl4nk_newline = True
+        handler.setFormatter(logging.Formatter("\n%(asctime)s - %(levelname)s - %(message)s"))
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.WARNING)
+
+
+_configure_retry_log_handler()
+
+
 class NowcoderCrawler:
     def __init__(self, config):
         self.config = config

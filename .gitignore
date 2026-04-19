@@ -1,6 +1,7 @@
 configs/app.json
 configs/advanced.json
 configs/debug.json
+docs/
 
 *.xlsx
 *.csv

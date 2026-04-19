@@ -158,8 +158,8 @@ class DataProcessor:
             self.company_cache_mode = "online"
         self.company_runtime_cache_enabled = bool(self.config.get("company_runtime_cache_enabled", True))
         runtime_cache_path = str(
-            self.config.get("company_runtime_cache_path", "ENV/.cache/company_resolver_cache.json")
-            or "ENV/.cache/company_resolver_cache.json"
+            self.config.get("company_runtime_cache_path", "env/.cache/company_resolver_cache.json")
+            or "env/.cache/company_resolver_cache.json"
         ).strip()
         if runtime_cache_path and not os.path.isabs(runtime_cache_path):
             runtime_cache_path = os.path.join(os.getcwd(), runtime_cache_path)
@@ -1176,6 +1176,10 @@ class DataProcessor:
 
     def save_to_excel(self, df: pd.DataFrame, filename="nowcoder_data.xlsx"):
         try:
+            parent_dir = os.path.dirname(str(filename))
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+
             with pd.ExcelWriter(filename, engine='xlsxwriter') as writer:
                 df.to_excel(writer, index=False, sheet_name='面经汇总')
                 workbook = writer.book
@@ -1195,7 +1199,7 @@ class DataProcessor:
                     total_rows = len(df)
                     for row_num, title_value in enumerate(df['标题'].tolist(), start=1):
                         worksheet.write(row_num, title_col_idx, title_value, title_format)
-                        self._render_export_progress(row_num, total_rows, "Excel写入进度")
+                        self._render_export_progress(row_num, total_rows, "XLSX 写入进度")
 
                 if '帖子链接' in df.columns:
                     link_col_idx = df.columns.get_loc('帖子链接')
@@ -1232,10 +1236,10 @@ class DataProcessor:
                     else:
                         worksheet.set_column(col_range, width, top_format)
 
-            print(f"数据已成功排版并存入全局单个文件: '{filename}'")
+            print(f"数据已成功排版并存入 XLSX 文件: '{filename}'")
                 
         except Exception as e:
-            print(f"保存至 Excel 失败: {e}")
+            print(f"保存至 XLSX 失败: {e}")
 
     def save_to_markdown(self, df: pd.DataFrame, filename="nowcoder_data.md"):
         if df.empty:
@@ -1243,6 +1247,10 @@ class DataProcessor:
             return
             
         try:
+            parent_dir = os.path.dirname(str(filename))
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+
             import datetime
             with open(filename, 'w', encoding='utf-8') as f:
                 f.write("# 牛客网面经汇总\n\n")
@@ -1277,6 +1285,10 @@ class DataProcessor:
             return
 
         try:
+            parent_dir = os.path.dirname(str(filename))
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+
             with open(filename, 'w', encoding='utf-8') as f:
                 total_rows = len(df)
                 for row_index, (_, row) in enumerate(df.iterrows(), start=1):

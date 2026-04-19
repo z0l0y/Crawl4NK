@@ -50,7 +50,7 @@ def _normalize_config_paths(config: Dict[str, Any]) -> Dict[str, Any]:
     normalized["companies_path"] = _resolve_path(companies_path)
 
     company_runtime_cache_path = str(
-        normalized.get("company_runtime_cache_path", "ENV/.cache/company_resolver_cache.json")
+        normalized.get("company_runtime_cache_path", "env/.cache/company_resolver_cache.json")
         or ""
     ).strip()
     if company_runtime_cache_path:
@@ -59,7 +59,7 @@ def _normalize_config_paths(config: Dict[str, Any]) -> Dict[str, Any]:
     filter_rules = normalized.setdefault("filter_rules", {})
 
     pattern_cache = filter_rules.setdefault("pattern_cache", {})
-    cache_dir = str(pattern_cache.get("cache_dir", "ENV/.cache/text_matcher") or "").strip()
+    cache_dir = str(pattern_cache.get("cache_dir", "env/.cache/text_matcher") or "").strip()
     if cache_dir:
         pattern_cache["cache_dir"] = _resolve_path(cache_dir)
 
