@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pages", type=int, help="最多搜索的页数")
     parser.add_argument("--items", type=int, help="每个关键词最多爬取的帖子数")
     parser.add_argument("--fill-valid-quota", action="store_true", help="按清洗后有效数据尽量补齐配额")
+    parser.add_argument("--stream", action="store_true", help="启用流式抓取+清洗模式")
     parser.add_argument("--output", type=str, help="输出文件名前缀")
     return parser.parse_args()
 
@@ -67,6 +68,8 @@ def apply_cli_overrides(config: Dict, args: argparse.Namespace) -> Dict:
         config["max_items_per_keyword"] = args.items
     if args.fill_valid_quota:
         config["fill_valid_quota"] = True
+    if args.stream:
+        config["streaming_process_enabled"] = True
     if args.output:
         config["output_file"] = args.output
     return config
@@ -106,6 +109,14 @@ def print_runtime_summary(config: Dict, loaded_files: List[str], keywords: List[
     else:
         print("采集模式 -> 归档配额优先 (达到 max_items_per_keyword 后提前停止)")
     print("页数策略 -> fill_valid_quota=false 时严格按 max_pages；fill_valid_quota=true 时允许动态扩页(受 max_pages_hard_limit 限制)")
+    print(f"搜索调度策略 -> {str(config.get('search_page_strategy', 'bfs') or 'bfs').lower()}")
+    print(f"流式处理 -> {bool(config.get('streaming_process_enabled', True))}")
+    if bool(config.get("proxy_rotation_enabled", False)):
+        print(f"代理轮换 -> 开启 (proxy_pool 数量: {len(config.get('proxy_pool', []) or [])})")
+    elif config.get("http_proxy") or config.get("https_proxy"):
+        print("代理模式 -> 固定代理")
+    else:
+        print("代理模式 -> 关闭")
 
     filter_rules = config.get("filter_rules", {})
     force_combine = filter_rules.get("force_combine", {})
@@ -141,6 +152,7 @@ def print_runtime_summary(config: Dict, loaded_files: List[str], keywords: List[
     print(f"评论抓取 -> {fetch_comments_enabled}")
     print(f"评论列导出 -> {include_comments_column}")
     print(f"耗时分析日志 -> {bool(config.get('timing_profile_log', False))}")
+    print(f"指标汇总日志 -> {bool(config.get('metrics_summary_log', True))}")
     print(f"进度条刷新节流 -> {config.get('progress_render_interval_sec', 0.08)}s")
     if fetch_comments_enabled:
         print(
@@ -284,6 +296,38 @@ def print_pipeline_timing(enabled: bool, stage_costs: Dict[str, float]):
     print("[TimeProfile] pipeline: " + " | ".join(parts))
 
 
+def print_crawl_metrics(crawler: NowcoderCrawler, enabled: bool = True):
+    if not enabled:
+        return
+
+    metrics = crawler.get_metrics_snapshot()
+    print("[Metrics] crawl summary")
+    print(
+        "  "
+        f"search_req={metrics.get('search_requests', 0)} "
+        f"search_ok={metrics.get('search_success', 0)} "
+        f"search_rate={metrics.get('search_success_rate', 0)}%"
+    )
+    print(
+        "  "
+        f"detail_api={metrics.get('detail_api_requests', 0)} "
+        f"detail_page={metrics.get('detail_page_requests', 0)} "
+        f"detail_rate={metrics.get('detail_success_rate', 0)}%"
+    )
+    print(
+        "  "
+        f"comments_req={metrics.get('comment_requests', 0)} "
+        f"comments_rate={metrics.get('comment_success_rate', 0)}% "
+        f"timeouts={metrics.get('network_timeout', 0)} "
+        f"errors={metrics.get('network_error', 0)}"
+    )
+    print(
+        "  "
+        f"candidates={metrics.get('candidate_seen', 0)} "
+        f"archived={metrics.get('archived_items', 0)}"
+    )
+
+
 def main():
     pipeline_start = time.perf_counter()
     config, loaded_files = load_config()
@@ -300,6 +344,10 @@ def main():
     runtime_summary_log = bool(config.get("runtime_summary_log", False))
     timing_profile_log = bool(config.get("timing_profile_log", False))
     stage_spinner_enabled = bool(config.get("stage_spinner_enabled", True))
+    streaming_process_enabled = bool(config.get("streaming_process_enabled", True))
+    metrics_summary_log = bool(config.get("metrics_summary_log", True))
+    streaming_queue_size = max(int(config.get("streaming_queue_size", 64) or 64), 1)
+    show_progress_bar = bool(config.get("show_progress_bar", True))
     try:
         stage_spinner_interval_sec = float(config.get("stage_spinner_interval_sec", 0.12) or 0.12)
     except Exception:
@@ -319,54 +367,97 @@ def main():
     )
     crawler_init_elapsed = time.perf_counter() - crawler_init_start
 
-    crawl_start = time.perf_counter()
-    raw_data = crawler.crawl()
-    crawl_elapsed = time.perf_counter() - crawl_start
-    print_filtered_score_details(crawler, config)
+    process_elapsed = 0.0
+    crawl_elapsed = 0.0
 
-    if not raw_data:
-        print_pipeline_timing(
-            timing_profile_log,
-            {
-                "crawler_init": crawler_init_elapsed,
-                "crawl": crawl_elapsed,
-                "total": time.perf_counter() - pipeline_start,
-            },
+    if streaming_process_enabled:
+        processor = run_with_spinner(
+            "初始化数据处理器",
+            lambda: DataProcessor([], config=config),
+            enabled=stage_spinner_enabled,
+            interval_sec=stage_spinner_interval_sec,
         )
-        if crawler.score_filter_enabled and crawler.score_filtered_count > 0:
-            print("未抓取到任何符合要求的数据！当前评分阈值可能偏高，可下调 score_filter.threshold 或放宽关键词加分配置。")
-        else:
-            print("未抓取到任何符合要求的数据！请检查配置文件的关键词与过滤规则，或检查网络和 Cookie。")
-        return
 
-    print(f"抓取完成，共获取 {len(raw_data)} 篇候选帖子。开始进行清洗和智能打标...")
+        stream_start = time.perf_counter()
+        df = run_with_spinner(
+            "流式抓取与清洗",
+            lambda: processor.process_iterable(crawler.iter_crawl_items(queue_size=streaming_queue_size)),
+            enabled=stage_spinner_enabled and (not show_progress_bar),
+            interval_sec=stage_spinner_interval_sec,
+        )
+        crawl_elapsed = time.perf_counter() - stream_start
+        print_filtered_score_details(crawler, config)
+        print_crawl_metrics(crawler, enabled=metrics_summary_log)
 
-    process_start = time.perf_counter()
-    processor = run_with_spinner(
-        "初始化数据处理器",
-        lambda: DataProcessor(raw_data, config=config),
-        enabled=stage_spinner_enabled,
-        interval_sec=stage_spinner_interval_sec,
-    )
-    df = run_with_spinner(
-        "数据清洗与打标",
-        lambda: processor.process(),
-        enabled=stage_spinner_enabled and (not bool(config.get("show_progress_bar", True))),
-        interval_sec=stage_spinner_interval_sec,
-    )
-    process_elapsed = time.perf_counter() - process_start
+        if processor.last_processed_input_count <= 0:
+            print_pipeline_timing(
+                timing_profile_log,
+                {
+                    "crawler_init": crawler_init_elapsed,
+                    "stream_crawl_process": crawl_elapsed,
+                    "total": time.perf_counter() - pipeline_start,
+                },
+            )
+            if crawler.score_filter_enabled and crawler.score_filtered_count > 0:
+                print("未抓取到任何符合要求的数据！当前评分阈值可能偏高，可下调 score_filter.threshold 或放宽关键词加分配置。")
+            else:
+                print("未抓取到任何符合要求的数据！请检查配置文件的关键词与过滤规则，或检查网络和 Cookie。")
+            return
+
+        print(f"流式抓取完成，共处理 {processor.last_processed_input_count} 篇候选帖子。")
+    else:
+        crawl_start = time.perf_counter()
+        raw_data = crawler.crawl()
+        crawl_elapsed = time.perf_counter() - crawl_start
+        print_filtered_score_details(crawler, config)
+        print_crawl_metrics(crawler, enabled=metrics_summary_log)
+
+        if not raw_data:
+            print_pipeline_timing(
+                timing_profile_log,
+                {
+                    "crawler_init": crawler_init_elapsed,
+                    "crawl": crawl_elapsed,
+                    "total": time.perf_counter() - pipeline_start,
+                },
+            )
+            if crawler.score_filter_enabled and crawler.score_filtered_count > 0:
+                print("未抓取到任何符合要求的数据！当前评分阈值可能偏高，可下调 score_filter.threshold 或放宽关键词加分配置。")
+            else:
+                print("未抓取到任何符合要求的数据！请检查配置文件的关键词与过滤规则，或检查网络和 Cookie。")
+            return
+
+        print(f"抓取完成，共获取 {len(raw_data)} 篇候选帖子。开始进行清洗和智能打标...")
+
+        process_start = time.perf_counter()
+        processor = run_with_spinner(
+            "初始化数据处理器",
+            lambda: DataProcessor(raw_data, config=config),
+            enabled=stage_spinner_enabled,
+            interval_sec=stage_spinner_interval_sec,
+        )
+        df = run_with_spinner(
+            "数据清洗与打标",
+            lambda: processor.process(),
+            enabled=stage_spinner_enabled and (not show_progress_bar),
+            interval_sec=stage_spinner_interval_sec,
+        )
+        process_elapsed = time.perf_counter() - process_start
+
     processor.display_stats(df)
 
     if df.empty:
-        print_pipeline_timing(
-            timing_profile_log,
-            {
-                "crawler_init": crawler_init_elapsed,
-                "crawl": crawl_elapsed,
-                "process": process_elapsed,
-                "total": time.perf_counter() - pipeline_start,
-            },
-        )
+        timing_payload = {
+            "crawler_init": crawler_init_elapsed,
+            "total": time.perf_counter() - pipeline_start,
+        }
+        if streaming_process_enabled:
+            timing_payload["stream_crawl_process"] = crawl_elapsed
+        else:
+            timing_payload["crawl"] = crawl_elapsed
+            timing_payload["process"] = process_elapsed
+
+        print_pipeline_timing(timing_profile_log, timing_payload)
         print("清洗完成后无可归档数据（标题中未识别公司名的帖子已过滤）。")
         return
 
@@ -374,21 +465,23 @@ def main():
     run_with_spinner(
         "导出文件",
         lambda: export_outputs(processor, df, output_paths, formats),
-        enabled=stage_spinner_enabled and (not bool(config.get("show_progress_bar", True))),
+        enabled=stage_spinner_enabled and (not show_progress_bar),
         interval_sec=stage_spinner_interval_sec,
     )
     export_elapsed = time.perf_counter() - export_start
 
-    print_pipeline_timing(
-        timing_profile_log,
-        {
-            "crawler_init": crawler_init_elapsed,
-            "crawl": crawl_elapsed,
-            "process": process_elapsed,
-            "export": export_elapsed,
-            "total": time.perf_counter() - pipeline_start,
-        },
-    )
+    timing_payload = {
+        "crawler_init": crawler_init_elapsed,
+        "export": export_elapsed,
+        "total": time.perf_counter() - pipeline_start,
+    }
+    if streaming_process_enabled:
+        timing_payload["stream_crawl_process"] = crawl_elapsed
+    else:
+        timing_payload["crawl"] = crawl_elapsed
+        timing_payload["process"] = process_elapsed
+
+    print_pipeline_timing(timing_profile_log, timing_payload)
 
 
 if __name__ == "__main__":

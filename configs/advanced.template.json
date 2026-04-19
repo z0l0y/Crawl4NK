@@ -37,6 +37,16 @@
     "request_read_timeout":  15,
     "request_retry_count":  2,
     "request_retry_backoff":  0.5,
+    "search_page_strategy":  "bfs",
+    "streaming_process_enabled":  true,
+    "streaming_queue_size":  64,
+    "metrics_summary_log":  true,
+    "proxy_rotation_enabled":  false,
+    "proxy_pool":  [
+
+                   ],
+    "http_proxy":  "",
+    "https_proxy":  "",
     "fetch_comments_enabled":  false,
     "include_comments_column":  false,
     "comment_request_min_interval_sec":  0.25,

@@ -3,7 +3,7 @@ import os
 import re
 import time
 import urllib.parse
-from typing import Dict, List
+from typing import Dict, Iterable, List
 
 import pandas as pd
 import requests
@@ -185,6 +185,8 @@ class DataProcessor:
         self.max_items_per_keyword = int(self.config.get("max_items_per_keyword", 0) or 0)
         self.dropped_unknown_company_count = 0
         self.dropped_unknown_company_examples = []
+        self.last_processed_input_count = 0
+        self.last_kept_record_count = 0
 
         self.companies = self._load_companies()
         self.owner_alias_to_company = self._load_owner_aliases()
@@ -1070,20 +1072,30 @@ class DataProcessor:
         self.dropped_unknown_company_examples.append(unknown_example)
 
     def process(self):
+        total_items = len(self.data)
+        return self._process_items(self.data, total_items=total_items)
+
+    def process_iterable(self, items: Iterable[Dict], total_items: int = 0):
+        return self._process_items(items, total_items=max(int(total_items or 0), 0))
+
+    def _process_items(self, items: Iterable[Dict], total_items: int = 0):
         cleaned_data = []
         self.dropped_unknown_company_count = 0
         self.dropped_unknown_company_examples = []
+        self.last_processed_input_count = 0
+        self.last_kept_record_count = 0
         kept_keyword_counter = {}
         expected_columns = self._build_expected_columns()
 
         try:
-            total_items = len(self.data)
-            for idx, item in enumerate(self.data, start=1):
+            for idx, item in enumerate(items, start=1):
+                self.last_processed_input_count = idx
                 keyword = item.get("keyword", "")
 
                 if self.max_items_per_keyword > 0 and keyword:
                     if kept_keyword_counter.get(keyword, 0) >= self.max_items_per_keyword:
-                        self._render_clean_progress(idx, total_items)
+                        if total_items > 0:
+                            self._render_clean_progress(idx, total_items)
                         continue
 
                 title = item.get("title", "")
@@ -1102,15 +1114,18 @@ class DataProcessor:
                         title=title,
                         url=item.get("url", ""),
                     )
-                    self._render_clean_progress(idx, total_items)
+                    if total_items > 0:
+                        self._render_clean_progress(idx, total_items)
                     continue
 
                 cleaned_data.append(record)
                 if keyword:
                     kept_keyword_counter[keyword] = kept_keyword_counter.get(keyword, 0) + 1
 
-                self._render_clean_progress(idx, total_items)
+                if total_items > 0:
+                    self._render_clean_progress(idx, total_items)
 
+            self.last_kept_record_count = len(cleaned_data)
             df = pd.DataFrame(cleaned_data, columns=expected_columns)
             return df
         finally:
@@ -1307,7 +1322,7 @@ class DataProcessor:
                     f.write("\n" + "="*80 + "\n\n")
                     self._render_export_progress(row_index, total_rows, "TXT写入进度")
 
-            print(f"数据已成功排版并存入纯文本 TXT 文件: '{filename}'")
+            print(f"数据已成功排版并存入 TXT 文件: '{filename}'")
 
         except Exception as e:
             print(f"保存至 TXT 失败: {e}")

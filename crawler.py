@@ -5,6 +5,7 @@ import math
 import random
 import re
 import sys
+import threading
 import time
 import urllib.parse
 
@@ -15,6 +16,7 @@ from requests.exceptions import Timeout
 from urllib3.util.retry import Retry
 
 from matcher import TextMatcher
+from scheduler import SearchPageScheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -50,6 +52,9 @@ class NowcoderCrawler:
         self.max_items = max(int(config.get("max_items_per_keyword", 10) or 0), 0)
         self.max_pages_hard_limit = max(int(config.get("max_pages_hard_limit", 50) or 50), self.max_pages)
         self.fill_valid_quota = bool(config.get("fill_valid_quota", False))
+        self.search_page_strategy = str(config.get("search_page_strategy", "bfs") or "bfs").strip().lower()
+        if self.search_page_strategy not in SearchPageScheduler.SUPPORTED_STRATEGIES:
+            self.search_page_strategy = "bfs"
         self.filter_rules = config.get("filter_rules", {})
         self.score_filter_cfg = self.filter_rules.get("score_filter", {})
         self.ac_backend = str(config.get("ac_backend", "auto") or "auto").strip().lower()
@@ -90,6 +95,14 @@ class NowcoderCrawler:
         self.request_read_timeout = float(config.get("request_read_timeout", 15) or 15)
         self.request_retry_count = int(config.get("request_retry_count", 2) or 2)
         self.request_retry_backoff = float(config.get("request_retry_backoff", 0.5) or 0.5)
+        self.proxy_rotation_enabled = bool(config.get("proxy_rotation_enabled", False))
+        raw_proxy_pool = config.get("proxy_pool", [])
+        if isinstance(raw_proxy_pool, str):
+            raw_proxy_pool = [raw_proxy_pool]
+        self.proxy_pool = [str(item or "").strip() for item in (raw_proxy_pool or []) if str(item or "").strip()]
+        self.http_proxy = str(config.get("http_proxy", "") or "").strip()
+        self.https_proxy = str(config.get("https_proxy", "") or "").strip()
+        self._proxy_cursor = 0
         try:
             comment_min_interval = float(config.get("comment_request_min_interval_sec", 0.25) or 0.25)
         except Exception:
@@ -180,6 +193,21 @@ class NowcoderCrawler:
         self._live_line_len = 0
         self._progress_last_render_ts = 0.0
         self._progress_last_signature = ""
+        self._metrics = {
+            "search_requests": 0,
+            "search_success": 0,
+            "search_non_200": 0,
+            "detail_api_requests": 0,
+            "detail_api_success": 0,
+            "detail_page_requests": 0,
+            "detail_page_success": 0,
+            "comment_requests": 0,
+            "comment_success": 0,
+            "network_timeout": 0,
+            "network_error": 0,
+            "candidate_seen": 0,
+            "archived_items": 0,
+        }
 
         if self.crawl_debug_log:
             logging.getLogger().setLevel(logging.INFO)
@@ -256,6 +284,67 @@ class NowcoderCrawler:
     def _log_error(self, message: str):
         self._ensure_progress_newline()
         logging.error(message)
+
+    def _metric_inc(self, key: str, amount: int = 1):
+        if key not in self._metrics:
+            return
+        self._metrics[key] = int(self._metrics.get(key, 0) or 0) + int(amount)
+
+    def _build_request_proxies(self) -> dict:
+        if self.proxy_rotation_enabled and self.proxy_pool:
+            proxy_url = self.proxy_pool[self._proxy_cursor % len(self.proxy_pool)]
+            self._proxy_cursor += 1
+            return {"http": proxy_url, "https": proxy_url}
+
+        if self.http_proxy or self.https_proxy:
+            return {
+                "http": self.http_proxy or self.https_proxy,
+                "https": self.https_proxy or self.http_proxy,
+            }
+
+        if self.proxy_pool:
+            proxy_url = self.proxy_pool[0]
+            return {"http": proxy_url, "https": proxy_url}
+
+        return {}
+
+    def _request(self, method: str, url: str, **kwargs):
+        request_kwargs = dict(kwargs)
+        if "proxies" not in request_kwargs:
+            proxies = self._build_request_proxies()
+            if proxies:
+                request_kwargs["proxies"] = proxies
+        return self.session.request(method=method, url=url, **request_kwargs)
+
+    def get_metrics_snapshot(self) -> dict:
+        snapshot = dict(self._metrics)
+        search_requests = max(int(snapshot.get("search_requests", 0) or 0), 1)
+        detail_attempts = int(snapshot.get("detail_api_requests", 0) or 0) + int(
+            snapshot.get("detail_page_requests", 0) or 0
+        )
+        detail_attempts = max(detail_attempts, 1)
+        comment_requests = max(int(snapshot.get("comment_requests", 0) or 0), 1)
+
+        snapshot["search_success_rate"] = round(
+            (int(snapshot.get("search_success", 0) or 0) / float(search_requests)) * 100.0,
+            2,
+        )
+        snapshot["detail_success_rate"] = round(
+            (
+                int(snapshot.get("detail_api_success", 0) or 0)
+                + int(snapshot.get("detail_page_success", 0) or 0)
+            )
+            / float(detail_attempts)
+            * 100.0,
+            2,
+        )
+        snapshot["comment_success_rate"] = round(
+            (int(snapshot.get("comment_success", 0) or 0) / float(comment_requests)) * 100.0,
+            2,
+        )
+        snapshot["timing_totals"] = dict(self._timing_totals)
+        snapshot["timing_counts"] = dict(self._timing_counts)
+        return snapshot
 
     def _render_live_line(self, display: str, finalize: bool = False):
         pad_len = max(self._live_line_len - len(display), 0)
@@ -368,12 +457,14 @@ class NowcoderCrawler:
 
     def _log_network_exception(self, stage: str, identifier: str, exc: Exception):
         if isinstance(exc, (Timeout, TimeoutError)):
+            self._metric_inc("network_timeout")
             msg = f"{stage} timeout, skipped: {identifier}"
             if self.crawl_debug_log:
                 msg += f" ({exc})"
             self._log_warning(msg)
             return
 
+        self._metric_inc("network_error")
         msg = f"{stage} request failed: {identifier}"
         if self.crawl_debug_log:
             msg += f" ({exc})"
@@ -543,15 +634,19 @@ class NowcoderCrawler:
         url = "https://gw-c.nowcoder.com/api/sparta/pc/search"
         seen_posts = set()
         page_limit = self._effective_page_limit()
+        page_scheduler = SearchPageScheduler(page_limit=page_limit, strategy=self.search_page_strategy)
         empty_page_streak = 0
         scanned_pages = 0
         stop_reason = "running"
         external_reason = ""
 
         try:
-            for page in range(1, page_limit + 1):
-                scanned_pages = page
-                self._render_activity_status(f"[search][{keyword}] page {page}/{page_limit}", force=True)
+            for page in page_scheduler.iter_pages():
+                scanned_pages += 1
+                page_label = f"{scanned_pages}/{page_limit}"
+                if self.search_page_strategy != "bfs":
+                    page_label += f" (real:{page})"
+                self._render_activity_status(f"[search][{keyword}] page {page_label}", force=True)
                 payload = {
                     "type": "all",
                     "query": keyword,
@@ -563,16 +658,18 @@ class NowcoderCrawler:
                     if self.crawl_debug_log:
                         logging.info(f"Searching keyword '{keyword}' page {page}...")
                     search_api_start = time.perf_counter()
-                    resp = self.session.post(url, json=payload, timeout=self.search_timeout)
+                    self._metric_inc("search_requests")
+                    resp = self._request("POST", url, json=payload, timeout=self.search_timeout)
                     self._record_timing("search_api", time.perf_counter() - search_api_start)
                     if resp.status_code == 200:
+                        self._metric_inc("search_success")
                         data = resp.json()
                         records = data.get("data", {}).get("records", [])
                         if not records:
                             empty_page_streak += 1
                             if self.search_page_progress_log and self.show_progress_bar and not self.crawl_debug_log:
-                                self._render_progress(page, page_limit, f"[search][{keyword}]")
-                            if page <= self.max_pages:
+                                self._render_progress(scanned_pages, page_limit, f"[search][{keyword}]")
+                            if scanned_pages <= self.max_pages:
                                 stop_reason = "结果页为空(提前结束)"
                                 break
                             if empty_page_streak >= 2:
@@ -612,6 +709,7 @@ class NowcoderCrawler:
                                     continue
                                 seen_posts.add(unique_key)
                                 matched_in_page += 1
+                                self._metric_inc("candidate_seen")
 
                                 yield {
                                     "id": post_id,
@@ -622,19 +720,21 @@ class NowcoderCrawler:
                                     "search_content": raw_content,
                                 }
 
-                        if matched_in_page == 0 and page > self.max_pages:
+                        if matched_in_page == 0 and scanned_pages > self.max_pages:
                             empty_page_streak += 1
                             if empty_page_streak >= 2:
                                 stop_reason = "连续页仅噪声/无可归档候选"
                                 break
-                    elif page > self.max_pages:
-                        empty_page_streak += 1
-                        if empty_page_streak >= 2:
-                            stop_reason = f"连续{empty_page_streak}页请求非200"
-                            break
+                    else:
+                        self._metric_inc("search_non_200")
+                        if scanned_pages > self.max_pages:
+                            empty_page_streak += 1
+                            if empty_page_streak >= 2:
+                                stop_reason = f"连续{empty_page_streak}页请求非200"
+                                break
 
                     if self.search_page_progress_log and self.show_progress_bar and not self.crawl_debug_log:
-                        self._render_progress(page, page_limit, f"[search][{keyword}]")
+                        self._render_progress(scanned_pages, page_limit, f"[search][{keyword}]")
 
                     time.sleep(random.uniform(1.5, 3.5))
                 except Exception as e:
@@ -703,13 +803,15 @@ class NowcoderCrawler:
 
             try:
                 api_url = f"https://gw-c.nowcoder.com/api/sparta/detail/{api_type}/detail/{detail_id}"
-                api_resp = self.session.get(api_url, headers=api_headers, timeout=self.detail_api_timeout)
+                self._metric_inc("detail_api_requests")
+                api_resp = self._request("GET", api_url, headers=api_headers, timeout=self.detail_api_timeout)
                 if api_resp.status_code != 200:
                     continue
 
                 res_json = api_resp.json()
                 data = res_json.get("data")
                 if isinstance(data, dict) and data.get("content"):
+                    self._metric_inc("detail_api_success")
                     return data.get("content", "")
             except Exception as e:
                 if self.crawl_debug_log:
@@ -882,14 +984,13 @@ class NowcoderCrawler:
     def _flush_scoring_buffer(
         self,
         scoring_buffer: list,
-        all_data: list,
         archived_for_keyword: int,
         heap_mode: bool = False,
         keyword_heap: list | None = None,
         keyword_heap_limit: int = 0,
-    ) -> tuple[int, bool, int, int]:
+    ) -> tuple[int, bool, int, int, list]:
         if not scoring_buffer:
-            return archived_for_keyword, False, 0, 0
+            return archived_for_keyword, False, 0, 0, []
 
         if self.score_filter_enabled and hasattr(self.matcher, "is_scoring_automaton_building"):
             try:
@@ -924,6 +1025,7 @@ class NowcoderCrawler:
         reached_limit = False
         replace_count_in_round = 0
         comment_fetch_count = 0
+        archived_items = []
         for item, score_report in zip(scoring_buffer, score_reports):
             if score_report.get("enabled"):
                 item["quality_score"] = score_report.get("score", 0)
@@ -957,8 +1059,9 @@ class NowcoderCrawler:
                 comment_fetch_count += 1
             else:
                 item["comments"] = []
-            all_data.append(item)
+            archived_items.append(item)
             archived_for_keyword += 1
+            self._metric_inc("archived_items")
             if self.crawl_debug_log:
                 logging.info(f"archived: {item['title']}")
 
@@ -967,7 +1070,7 @@ class NowcoderCrawler:
                 break
 
         scoring_buffer.clear()
-        return archived_for_keyword, reached_limit, replace_count_in_round, comment_fetch_count
+        return archived_for_keyword, reached_limit, replace_count_in_round, comment_fetch_count, archived_items
 
     def get_post_detail(self, post_id, post_uuid, detail_api_type=None):
         canonical_url = f"https://www.nowcoder.com/feed/main/detail/{post_uuid}"
@@ -988,7 +1091,8 @@ class NowcoderCrawler:
                 return {"content": self._clean_detail_content(content), "tags": [], "url": canonical_url}
 
             url = canonical_url
-            resp = self.session.get(url, timeout=self.detail_page_timeout)
+            self._metric_inc("detail_page_requests")
+            resp = self._request("GET", url, timeout=self.detail_page_timeout)
             if resp.status_code == 200 and not content:
                 content = self._extract_content_from_initial_state(resp.text, post_uuid)
 
@@ -998,6 +1102,7 @@ class NowcoderCrawler:
 
                 if content:
                     content = self._clean_detail_content(content)
+                    self._metric_inc("detail_page_success")
 
                 tags = [tag.get_text(strip=True) for tag in soup.find_all("a", class_="discuss-tag-item") if soup]
                 return {"content": content, "tags": tags, "url": url}
@@ -1027,8 +1132,10 @@ class NowcoderCrawler:
         }
         comment_fetch_start = time.perf_counter()
         try:
-            resp = self.session.post(url, json=payload, timeout=self.comment_timeout)
+            self._metric_inc("comment_requests")
+            resp = self._request("POST", url, json=payload, timeout=self.comment_timeout)
             if resp.status_code == 200:
+                self._metric_inc("comment_success")
                 data = resp.json().get("data", {}).get("records", [])
                 for c in data:
                     comment_text = c.get("content", "")
@@ -1049,8 +1156,15 @@ class NowcoderCrawler:
             self._record_timing("comment_fetch", time.perf_counter() - comment_fetch_start)
         return comments_list
 
-    def crawl(self):
+    def crawl(self, on_archived_item=None):
         all_data = []
+
+        def _emit_archived_item(item: dict):
+            if callable(on_archived_item):
+                on_archived_item(item)
+            else:
+                all_data.append(item)
+
         crawl_total_start = time.perf_counter()
         self._timing_live_started_at = crawl_total_start
         self._timing_live_last_ts = 0.0
@@ -1121,14 +1235,15 @@ class NowcoderCrawler:
 
                         if len(scoring_buffer) >= self.score_parallel_batch_size:
                             score_batch_size = len(scoring_buffer)
-                            archived_for_keyword, reached_quota, heap_replace_count, comment_batch_count = self._flush_scoring_buffer(
+                            archived_for_keyword, reached_quota, heap_replace_count, comment_batch_count, archived_batch = self._flush_scoring_buffer(
                                 scoring_buffer,
-                                all_data,
                                 archived_for_keyword,
                                 heap_mode=heap_mode,
                                 keyword_heap=keyword_heap,
                                 keyword_heap_limit=keyword_heap_limit,
                             )
+                            for archived_item in archived_batch:
+                                _emit_archived_item(archived_item)
                             scored_processed += score_batch_size
                             comment_processed += comment_batch_count
 
@@ -1201,14 +1316,15 @@ class NowcoderCrawler:
                         print(f"[pipeline][{kw}] search阶段结束，进入评分收尾...")
 
                     score_batch_size = len(scoring_buffer)
-                    archived_for_keyword, _, _, comment_batch_count = self._flush_scoring_buffer(
+                    archived_for_keyword, _, _, comment_batch_count, archived_batch = self._flush_scoring_buffer(
                         scoring_buffer,
-                        all_data,
                         archived_for_keyword,
                         heap_mode=heap_mode,
                         keyword_heap=keyword_heap,
                         keyword_heap_limit=keyword_heap_limit,
                     )
+                    for archived_item in archived_batch:
+                        _emit_archived_item(archived_item)
                     scored_processed += score_batch_size
                     comment_processed += comment_batch_count
                     if (
@@ -1249,7 +1365,8 @@ class NowcoderCrawler:
                                 self._render_progress(comment_processed, comment_total, f"[comment][{kw}]")
                         else:
                             item["comments"] = []
-                        all_data.append(item)
+                        _emit_archived_item(item)
+                        self._metric_inc("archived_items")
                     archived_for_keyword = len(ranked_items)
 
                 if self.show_progress_bar and (not self.crawl_debug_log):
@@ -1303,3 +1420,35 @@ class NowcoderCrawler:
                 self.matcher.shutdown()
             except Exception:
                 pass
+
+    def iter_crawl_items(self, queue_size: int = 64):
+        from queue import Queue
+
+        safe_queue_size = max(int(queue_size or 1), 1)
+        queue = Queue(maxsize=safe_queue_size)
+        sentinel = object()
+        worker_errors = []
+
+        def _on_archived_item(item: dict):
+            queue.put(item)
+
+        def _worker():
+            try:
+                self.crawl(on_archived_item=_on_archived_item)
+            except Exception as e:
+                worker_errors.append(e)
+            finally:
+                queue.put(sentinel)
+
+        worker = threading.Thread(target=_worker, daemon=True, name="crawl4nk-stream")
+        worker.start()
+
+        while True:
+            item = queue.get()
+            if item is sentinel:
+                break
+            yield item
+
+        worker.join(timeout=0.2)
+        if worker_errors:
+            raise worker_errors[0]
